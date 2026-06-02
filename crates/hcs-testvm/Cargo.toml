@@ -1,0 +1,22 @@
+[package]
+name = "hcs-testvm"
+description = "Test harness: stand up a throwaway Rocky Linux HCS compute system (direct kernel boot) and expose its HCS_SYSTEM handle for HDV to attach to. The spike-1 validation rig."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hcs-sys = { path = "../hcs-sys" }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+] }

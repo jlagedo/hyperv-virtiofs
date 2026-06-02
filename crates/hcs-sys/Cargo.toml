@@ -1,0 +1,12 @@
+[package]
+name = "hcs-sys"
+description = "Raw FFI to the Windows Host Compute System (HCS) control API (computecore.dll) — create/open/start/terminate a compute system."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

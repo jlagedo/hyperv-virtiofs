@@ -5,6 +5,8 @@ members = [
     "crates/hdv",
     "crates/virtio-hdv",
     "crates/hyperv_virtiofs",
+    "crates/hcs-sys",
+    "crates/hcs-testvm",
 ]
 
 [workspace.package]
