@@ -10,6 +10,7 @@
 #![cfg(windows)]
 
 use hcs_sys as hcs;
+use hdv::pci::{PciDetails, PciOps};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,6 +49,51 @@ impl FlexibleIovSlot {
             emulator_id: emulator_id.into(),
             hosting_model: "ExternalRestricted".into(),
         }
+    }
+}
+
+/// A deliberately driverless PCI device for the attach spikes: vendor `1af4`
+/// (Red Hat/virtio) + device id `1100`, which lies **outside** every virtio range
+/// so the guest enumerates it but binds no driver — a clean enumeration proof, no
+/// virtio semantics. Class `0xff` (unassigned) and no BARs keep the surface
+/// minimal. Shared by the in-process (`tests/attach.rs`) and out-of-process
+/// (`tests/attach_oop.rs` + `src/bin/attach_child.rs`) spikes so both attach a
+/// byte-identical device.
+pub struct SpikeDevice;
+
+impl SpikeDevice {
+    pub const VENDOR: u16 = 0x1af4;
+    pub const DEVICE: u16 = 0x1100;
+}
+
+impl PciOps for SpikeDevice {
+    fn details(&self) -> PciDetails {
+        PciDetails {
+            vendor_id: Self::VENDOR,
+            device_id: Self::DEVICE,
+            revision_id: 0x01,
+            prog_if: 0x00,
+            sub_class: 0x00,
+            base_class: 0xff, // "unassigned" class → no kernel driver claims it
+            sub_vendor_id: Self::VENDOR,
+            sub_system_id: 0x0040,
+            probed_bars: [0; 6], // no BARs — simplest enumerable device
+        }
+    }
+
+    fn read_config(&self, offset: u32) -> u32 {
+        // Coherent Type-0 header, robust whether HDV synthesizes these registers
+        // from `details()` or routes the reads to us.
+        match offset {
+            0x00 => ((Self::DEVICE as u32) << 16) | Self::VENDOR as u32,
+            0x08 => 0xff00_0001, // class 0xff0000, revision 0x01
+            0x2c => (0x0040u32 << 16) | Self::VENDOR as u32, // subsystem
+            _ => 0,              // no BARs, no caps, no interrupt
+        }
+    }
+
+    fn write_config(&self, _offset: u32, _value: u32) {
+        // Nothing writable matters for enumeration.
     }
 }
 

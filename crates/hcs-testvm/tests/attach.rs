@@ -21,53 +21,10 @@
 //!   cargo test -p hcs-testvm --test attach -- --ignored --nocapture
 #![cfg(windows)]
 
-use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
-use hdv::pci::{guid_to_string, PciDetails, PciDevice, PciOps, SPIKE_CLASS_ID, SPIKE_INSTANCE_ID};
+use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm, SpikeDevice};
+use hdv::pci::{guid_to_string, PciDevice, SPIKE_CLASS_ID, SPIKE_INSTANCE_ID};
 use hdv::DeviceHost;
 use std::time::Duration;
-
-/// A deliberately driverless PCI device: vendor `1af4` (Red Hat/virtio) + a
-/// device id (`1100`) that lies **outside** every virtio range, so the guest
-/// enumerates it but binds no driver — a clean enumeration proof, no virtio
-/// semantics required. Class `0xff` (unassigned) and **no BARs** keep the surface
-/// minimal.
-struct SpikeDevice;
-
-impl SpikeDevice {
-    const VENDOR: u16 = 0x1af4;
-    const DEVICE: u16 = 0x1100;
-}
-
-impl PciOps for SpikeDevice {
-    fn details(&self) -> PciDetails {
-        PciDetails {
-            vendor_id: Self::VENDOR,
-            device_id: Self::DEVICE,
-            revision_id: 0x01,
-            prog_if: 0x00,
-            sub_class: 0x00,
-            base_class: 0xff, // "unassigned" class → no kernel driver claims it
-            sub_vendor_id: Self::VENDOR,
-            sub_system_id: 0x0040,
-            probed_bars: [0; 6], // no BARs — simplest enumerable device
-        }
-    }
-
-    fn read_config(&self, offset: u32) -> u32 {
-        // Coherent Type-0 header, robust whether HDV synthesizes these registers
-        // from `details()` or routes the reads to us.
-        match offset {
-            0x00 => ((Self::DEVICE as u32) << 16) | Self::VENDOR as u32,
-            0x08 => 0xff00_0001, // class 0xff0000, revision 0x01
-            0x2c => (0x0040u32 << 16) | Self::VENDOR as u32, // subsystem
-            _ => 0,              // no BARs, no caps, no interrupt
-        }
-    }
-
-    fn write_config(&self, _offset: u32, _value: u32) {
-        // Nothing writable matters for enumeration.
-    }
-}
 
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
