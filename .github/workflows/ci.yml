@@ -31,12 +31,16 @@ jobs:
       # The committed header is the published contract. Regenerate and fail if it
       # drifted from the Rust source.
       - name: Verify C header is fresh
+        shell: pwsh
         run: |
           cargo install cbindgen --locked
           cbindgen --config cbindgen.toml --crate hyperv_virtiofs --output include/hyperv_virtiofs.gen.h
-          if (Get-FileHash include/hyperv_virtiofs.h).Hash -ne (Get-FileHash include/hyperv_virtiofs.gen.h).Hash) {
+          $committed = (Get-FileHash include/hyperv_virtiofs.h).Hash
+          $generated = (Get-FileHash include/hyperv_virtiofs.gen.h).Hash
+          if ($committed -ne $generated) {
+            git --no-pager diff --no-index include/hyperv_virtiofs.h include/hyperv_virtiofs.gen.h
+            Remove-Item include/hyperv_virtiofs.gen.h
             Write-Error "include/hyperv_virtiofs.h is stale. Run cbindgen and commit the result."
-            git diff --no-index include/hyperv_virtiofs.h include/hyperv_virtiofs.gen.h
             exit 1
           }
           Remove-Item include/hyperv_virtiofs.gen.h
