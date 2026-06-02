@@ -133,3 +133,28 @@ the host bridge is `HDV::VirtualMachine`; the proxy data path is `HDV::IPC::*`
 (`DeviceHostCallHandler`, `Details::CallHandlerThread`). Net: our binding
 `HdvInitializeDeviceHostForProxy(device_host_id: *const GUID, support: IUnknown*, out: HDV_HOST*)` and
 the `hdv::proxy` `IVmDeviceHostSupport` object are correct as shipped.
+
+## Third confirmation — the closed caller (`wsldevicehost.dll` Ghidra decompile)
+
+A full Ghidra decompilation of `wsldevicehost.dll` (the closed device host that *calls* these
+exports) independently re-confirms the ABI from the **caller's** side — a third source after the
+disasm of `vmdevicehost.dll` and the public `VmDeviceHost.pdb`:
+
+- **`HdvInitializeDeviceHostForProxy(ctx, support, &out)`** — decompiled verbatim as
+  `HdvInitializeDeviceHostForProxy(param_3, param_4, &local_48)`; `param_3` is the device-host id
+  GUID, `param_4` the `IVmDeviceHostSupport`. Confirms the 3-arg, two-in-one-out shape.
+- **`HdvCreateDeviceInstance(host, 1 /*Pci*/, classId, instanceId, vtable, ctx, &out)`** — decompiled
+  as `HdvCreateDeviceInstance(host, 1, param_3, instanceId, &DAT_…, ctx, &out)`. Matches `hdv-sys`.
+- **Both calls sit behind an optional trait-object test-seam**: `if (indirect == 0) { real export }
+  else { (*indirect_vtable + 0x28)(same args) }`. WSL swaps a mock host in for unit tests — direct
+  evidence the export is a clean, self-contained function boundary, which is why our single-process
+  `hdv::proxy` path (no COM surrogate) works.
+- **Three distinct device vtables** (`DAT_180132400`, `DAT_180132528`, `DAT_180168cf0`) ⇄ three
+  source files `hyper-v\hdv\src\{virtiofs,virtio_net,virtio_pmem}.rs` over a shared `api.rs` —
+  i.e. WSL ships three FlexibleIov emulators; we implement only the virtio-fs vtable. (The vtable
+  bodies are unresolved data blobs in the decompile; the slot layout comes from the SDK header /
+  PDB, not from this file.)
+- The bridge **links the public OpenVMM crates verbatim** (embedded panic paths):
+  `oss\vm\devices\virtio\virtiofs\src\lib.rs`, `oss\…\pci_core\src\{cfg_space_emu,capabilities\msix}.rs`,
+  `oss\vm\vmcore\guestmem`, `chipset_device`, the `virtio` transport — so the device crate is an
+  adapter over public code, not a reimplementation.
