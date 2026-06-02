@@ -1,5 +1,10 @@
 # hyperv-virtiofs
 
+[![CI](https://github.com/jlagedo/hyperv-virtiofs/actions/workflows/ci.yml/badge.svg)](https://github.com/jlagedo/hyperv-virtiofs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-informational)
+![ABI v2](https://img.shields.io/badge/C%20ABI-v2-blueviolet)
+
 **virtiofsd for Hyper-V.** A standalone C-ABI DLL that attaches an
 [OpenVMM](https://github.com/microsoft/openvmm) **virtio-fs** device to *any*
 HCS / Hyper-V guest via the Windows **Host Device Virtualization (HDV)** API — so a
@@ -137,6 +142,9 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
 
 ## Roadmap
 
+**Shipped** below; **all open work** (live removal, `ro` enforcement, caller-supplied GUIDs,
+logger wiring, coherent guest memory) lives in one place — [`docs/roadmap.md`](docs/roadmap.md).
+
 - [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and
   compiling on Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`,
   `lx`/`lxutil` FUSE backend). The foundational feasibility question is answered.
@@ -162,22 +170,20 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
   (`hcs-testvm/tests/attach_abi.rs`). Multiple shares coexist on one VM via the
   well-known virtio-fs class id + a caller-supplied unique instance id. Full design:
   [`docs/share-abi.md`](docs/share-abi.md).
-- [ ] **Live share removal** — `hvfs_remove_share` issues `FlexibleIov` Remove, but the
-  platform refuses it on current Windows (`ERROR_NOT_SUPPORTED`; WSL hits the same wall
-  and reclaims devices at VM shutdown). The DLL reports `HVFS_ERR_UNSUPPORTED` and
-  releases host-side resources; the guest device persists until the compute system is
-  torn down. Revisit if/when the platform adds hot-remove (`docs/hotplug-spike.md`).
-- [ ] **Caller-supplied class/host GUIDs** — the *instance* id is already caller-chosen
-  (`hvfs_add_share`); the device *class* is fixed to the well-known virtio-fs id (the
-  platform requires it for >1 device) and the device-**host** id is a built-in
-  constant. Let the host override the host id (e.g. to coexist with another device
-  host) where the platform allows.
-- [ ] **`ro` enforcement** — honor `ro: true` in the FUSE backend (today it is
-  honestly refused with `HVFS_ERR_NOT_IMPLEMENTED`), with a Windows reparse/junction-
-  safe directory jail.
-- [ ] **Coherent guest memory** — participate in HDV's aperture eviction protocol
-  (à la WSL's `HdvGuestMemoryEvictionWorker`) for a fully coherent, zero-copy mapping
-  (replacing the persistent-aperture + re-arm + retry mitigation).
+
+**Open work** — live share removal (platform-blocked), Windows support-matrix re-test, `ro`
+enforcement, caller-supplied class/host GUIDs, `hvfs_set_logger` wiring, and coherent guest
+memory — is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+
+## Contributing & security
+
+- **Contributing** — build, test, and PR guidance, plus the ABI-change process:
+  [`CONTRIBUTING.md`](.github/CONTRIBUTING.md).
+- **Open work** — everything left to develop, confirm, or unblock lives in
+  [`docs/roadmap.md`](docs/roadmap.md).
+- **Security** — this DLL sits on the host↔guest boundary; report vulnerabilities
+  privately per [`SECURITY.md`](.github/SECURITY.md), not via public issues.
+- **Conduct** — [`CODE_OF_CONDUCT.md`](.github/CODE_OF_CONDUCT.md).
 
 ## License
 

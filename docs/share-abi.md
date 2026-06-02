@@ -1,9 +1,12 @@
 # Share lifecycle ABI (v2) — device-per-share, honest to HDV/HCS
 
-Status: **design / proposed.** Supersedes the declarative `hvfs_set_shares` sketch (ABI v1),
-which assumed a mutable directory map. The hotplug spike (`docs/hotplug-spike.md`) proved that
-model impossible: OpenVMM's `VirtioFs` is single-root and immutable, so a live share is a *new
-device*, not a map entry. This ABI exposes that reality directly.
+Status: **implemented and shipped (ABI v2).** Landed in commit `29c6219`; the surface below is the
+one in `include/hyperv_virtiofs.h`, and it is verified end-to-end through a real HCS boot by
+`crates/hcs-testvm/tests/attach_abi.rs` (host_open → start → add_share → guest hot-mount →
+remove_share → host_close). Supersedes the declarative `hvfs_set_shares` sketch (ABI v1), which
+assumed a mutable directory map. The hotplug spike (`docs/hotplug-spike.md`) proved that model
+impossible: OpenVMM's `VirtioFs` is single-root and immutable, so a live share is a *new device*,
+not a map entry. This ABI exposes that reality directly.
 
 ## Design stance
 
@@ -70,7 +73,7 @@ closed.** Per-device `Remove` not working is *expected* — the real reclamation
 caller tears the compute system down (which closing the host, then stopping/deleting the system,
 accomplishes).
 
-## Proposed C ABI (v2 — breaking; `HVFS_ABI_VERSION` 1 → 2)
+## C ABI (v2 — breaking; `HVFS_ABI_VERSION` 1 → 2) — the shipped surface
 
 ```c
 #define HVFS_ABI_VERSION 2
@@ -131,7 +134,9 @@ void        hvfs_set_logger(hvfs_log_fn cb, void *ctx);
 - The old "caller-supplied GUIDs" follow-up is **partly resolved**: the device *class* can't be
   caller-chosen (platform), and the *instance* id is caller-optional here.
 
-## Implementation outline
+## Implementation (as landed)
+
+This is the shape that shipped in `29c6219`; it matches the outline below.
 
 - **`crates/hdv/src/pci.rs`** — add the well-known class constant
   `VIRTIO_FS_DEVICE_CLASS_ID = 872270E1-…`; make it the default class for `attach_shared`. Keep
@@ -142,7 +147,7 @@ void        hvfs_set_logger(hvfs_log_fn cb, void *ctx);
     `Mutex<Vec<*mut hvfs_share>>` registry }. `Send` justified as today.
   - `hvfs_share` { `VirtioHdvDevice`, `Arc<DeviceHost>` (clone), `instance_id: CString`,
     borrowed `HCS_SYSTEM` for its Remove }.
-  - `add_share`: parse → instance GUID (caller or generated) → `VirtioHdvDevice::attach_shared`
+  - `add_share`: parse → instance GUID (caller-supplied, required) → `VirtioHdvDevice::attach_shared`
     (well-known class) → build the Add `ModifySettingRequest` → `HcsModifyComputeSystem` → register
     in the host's slab → `Box::into_raw`.
   - `remove_share`: build the Remove request → `HcsModifyComputeSystem`; map `0x80070032` →
@@ -150,8 +155,8 @@ void        hvfs_set_logger(hvfs_log_fn cb, void *ctx);
   - `host_close`: drain the slab (Box::from_raw + drop each share), then drop host.
   - A small private `modify(system, json) -> HRESULT` helper over `hcs-sys` (the test rig's
     `RockyVm::modify` pattern, but the DLL owns its own).
-- **Instance-GUID generation** — `UuidCreate` (rpcrt4) binding, or accept caller-supplied only at
-  first. *(decision below.)*
+- **Instance-GUID** — caller-supplied only (resolved below); no `UuidCreate` dependency. A
+  missing/malformed `instance_id` → `HVFS_ERR_INVALID_ARG`.
 - **Header** — `cbindgen` regen, commit; bump `HVFS_ABI_VERSION` to 2.
 - **Test** — replace/extend `attach_abi.rs`: drive the real exports end-to-end through a booted VM
   — `host_open` (pre-start) → start → `add_share` ×2 (assert both mount) → `remove_share`

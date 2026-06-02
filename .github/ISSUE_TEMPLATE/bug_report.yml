@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a defect in the DLL, the ABI, or the build.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. For **security** issues, do not use this form —
+        follow [SECURITY.md](../blob/main/.github/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+      placeholder: hvfs_add_share returned … but the guest never saw the device.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal sequence of ABI calls / commands, or a code snippet.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit SHA of hyperv-virtiofs.
+      placeholder: v0.1.0 / 29c6219
+    validations:
+      required: true
+  - type: input
+    id: windows-build
+    attributes:
+      label: Windows build
+      description: Host build number (run `winver` or `[System.Environment]::OSVersion`).
+      placeholder: Windows 11 26200
+    validations:
+      required: true
+  - type: input
+    id: guest
+    attributes:
+      label: Guest (if relevant)
+      description: Guest OS / kernel for attach or mount issues.
+      placeholder: Rocky Linux 10 (EL10)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error text
+      description: >
+        Relevant output, including `hvfs_last_error()` text and any error codes.
+        This will be rendered as code.
+      render: text

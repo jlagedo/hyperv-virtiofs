@@ -208,15 +208,10 @@ references and reclaims everything at VM teardown. That is the pattern atelier s
   platform limitation WSL also hits). A device lingers until the VM is recycled.
 
 So **Strategy B is viable for the add path atelier needs**, with one caveat to design
-around: **no reliable live removal**. Options for the removal story:
-1. **Accept lingering + recycle** — cap concurrent devices; when sessions churn, rely on
-   atelier's existing hibernate/restart to recycle the VM and reclaim devices. Simple;
-   matches WSL's own posture.
-2. **Re-test removal on other Windows builds** — WSL's "not all versions" implies some
-   support it; worth confirming the support matrix before committing.
-3. **Hybrid** — device-per-*active*-session for the live mount, but avoid churn by
-   reusing a small device pool where possible (limited by the share being baked into the
-   `VirtioFsDevice` at construction).
+around: **no reliable live removal**. What shipped copes by reclaim-at-recycle (the DLL frees
+host-side resources; the guest device lingers until the VM is torn down). The open follow-ups this
+leaves — confirming removal across the Windows support matrix, and the recycle policy — are tracked
+in [`roadmap.md`](roadmap.md), not here; this doc is the spike record.
 
 This is materially better than the earlier "multi-device blocked" reading: concurrency —
 the thing atelier fundamentally needs — **works**. Only the teardown is constrained, and

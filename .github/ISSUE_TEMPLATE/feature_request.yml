@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a capability or change.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open development work is tracked in
+        [docs/roadmap.md](../blob/main/docs/roadmap.md). Please check it first — your
+        idea may already be scoped there.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that you can't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should change? Note if it affects the C ABI / header.
+    validations:
+      required: true
+  - type: dropdown
+    id: abi-impact
+    attributes:
+      label: Does this change the C ABI?
+      options:
+        - "No"
+        - "Yes — backward-compatible addition"
+        - "Yes — breaking (needs hvfs_abi_version bump)"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

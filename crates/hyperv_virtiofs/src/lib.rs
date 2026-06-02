@@ -577,5 +577,6 @@ pub type hvfs_log_fn = Option<extern "C" fn(level: c_int, msg: *const c_char, ct
 #[no_mangle]
 pub unsafe extern "C" fn hvfs_set_logger(cb: hvfs_log_fn, ctx: *mut c_void) {
     // TODO: store cb/ctx in a global and route the device-host log stream to it.
+    // No-op stub today; tracked in docs/roadmap.md ("Wire hvfs_set_logger").
     let _ = (cb, ctx);
 }
