@@ -9,11 +9,16 @@ in-box device support.
 It is the open counterpart to the device-host glue that ships **closed** inside
 WSL's `wsldevicehost.dll`.
 
-> **Status: work in progress.** The public C ABI is stable, and the OpenVMM
-> `virtio` + `virtiofs` crates are **wired in and compiling** on Windows (the
-> reuse that avoids reimplementing a FUSE server — verified, not assumed). The
-> remaining work is the HDV transport bridge itself; until it lands, `hvfs_attach`
-> returns `HVFS_ERR_NOT_IMPLEMENTED`. See [Roadmap](#roadmap).
+> **Status: the core is proven.** A stock Rocky Linux 10 (EL10) guest under
+> Hyper-V/HCS **mounts a host directory over our HDV virtio-fs bridge** — reads a
+> host file and writes one back — with no 9p and no kernel changes
+> (`hcs-testvm/tests/attach_virtiofs.rs`, `PROOF_COMPLETE_PASS`). The transport
+> (`virtio-hdv`) drives OpenVMM's public `VirtioPciDevice`/`VirtioFsDevice` over
+> the `ExternalRestricted` FlexibleIov proxy path. Remaining for product use:
+> wire `hvfs_attach` (still `HVFS_ERR_NOT_IMPLEMENTED`), live `set_shares`, and a
+> fully coherent guest-memory mapping (HDV apertures are an evictable cache; the
+> proof uses a persistent mapping + interrupt re-arm + boot retry to mask the
+> residual staleness). See [Roadmap](#roadmap).
 
 ## Why
 
@@ -107,23 +112,28 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
 - [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and
   compiling on Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`,
   `lx`/`lxutil` FUSE backend). The foundational feasibility question is answered.
-1. **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
-   `HdvCreateDeviceInstance`, guest-memory apertures, doorbells) and safe wrappers.
-2. **HDV attach handshake** *(the linchpin)* — prove `HdvInitializeDeviceHost`
-   against an HCS compute system owned by the caller, surfacing a PCI device the
-   guest enumerates (spike: a minimal device, no virtio). Resolves whether the
-   in-process model needs a compute-system device slot. Until the transport lands,
-   `hvfs_attach` is `HVFS_ERR_NOT_IMPLEMENTED`.
-3. **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: OpenVMM's
-   `VirtioPciDevice` is public (`virtio::VirtioPciDevice`, re-exported from the
-   `transport` module) and `VirtioPciDevice::new` takes exactly the seams HDV
-   provides — `GuestMemory` (← apertures via `GuestMemoryAccess`), `DoorbellRegistration`
-   (← `HdvRegisterDoorbell`), `PciInterruptModel::Msix` (← `HdvDeliverGuestInterrupt`),
-   `RegisterMmioIntercept` (← HDV BAR callbacks). Wire those ~4 adapters and drive the
-   reused `VirtioFsDevice`. (Confirmed by forensics of `wsldevicehost.dll`, whose own
-   `hyper-v\hdv\src\virtio_hdv.rs` reuses these same public crates.)
-4. **`set_shares`** — live directory-map updates with a Windows reparse/junction-
-   safe directory jail.
+- [x] **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
+  `HdvCreateDeviceInstance`, guest-memory apertures, doorbells, the proxy ABI) and
+  safe wrappers.
+- [x] **HDV attach handshake** *(the linchpin)* — the `ExternalRestricted` FlexibleIov
+  proxy path works in-process: `HdvInitializeDeviceHostForProxy` →
+  `IVmDeviceHostSupport::RegisterDeviceHost` → `HdvProxyDeviceHost`, then the guest
+  enumerates the device over VMBus VPCI (`docs/hdv-proxy-abi.md`).
+- [x] **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: implements
+  `hdv::pci::PciOps` over OpenVMM's public `VirtioPciDevice`, backing its seams with
+  HDV — `GuestMemory` ← apertures (`HdvCreateGuestMemoryAperture`),
+  `PciInterruptModel::Msix` ← `HdvDeliverGuestInterrupt`, PCI config + BAR MMIO ←
+  HDV's device-vtable callbacks (routed `(bar, offset)` → `find_bar` via internal
+  BAR bases, since the VMBus VID owns guest-facing BAR placement). Drives the reused
+  `VirtioFsDevice`; the guest mounts and does file I/O. (`shmem_size = 0` → no DAX
+  BAR yet.)
+- [ ] **Wire `hvfs_attach`** — call `VirtioHdvDevice::attach` from the cdylib
+  (currently `HVFS_ERR_NOT_IMPLEMENTED`).
+- [ ] **Coherent guest memory** — participate in HDV's aperture eviction protocol
+  (à la WSL's `HdvGuestMemoryEvictionWorker`) for a fully coherent, zero-copy mapping
+  (replacing the persistent-aperture + re-arm + retry mitigation).
+- [ ] **`set_shares`** — live directory-map updates with a Windows reparse/junction-
+  safe directory jail.
 
 ## License
 
