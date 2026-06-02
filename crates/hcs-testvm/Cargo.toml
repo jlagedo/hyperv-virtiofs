@@ -20,8 +20,9 @@ hdv = { path = "../hdv" }
 virtio-hdv = { path = "../virtio-hdv" }
 
 [dev-dependencies]
-# `tests/attach_abi.rs` drives the cdylib's exported C ABI (hvfs_attach/hvfs_detach)
-# end-to-end — links it in-process via its rlib output.
+# `tests/attach_abi.rs` drives the cdylib's exported C ABI (hvfs_host_open /
+# hvfs_add_share / hvfs_remove_share / hvfs_host_close) end-to-end — links it
+# in-process via its rlib output.
 hyperv_virtiofs = { path = "../hyperv_virtiofs" }
 
 [target.'cfg(windows)'.dependencies]

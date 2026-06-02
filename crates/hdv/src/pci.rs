@@ -58,6 +58,20 @@ pub const HVFS_DEVICE_HOST_ID: sys::GUID = sys::GUID {
     Data4: [0x9c, 0x00, 0xa7, 0xe1, 0x00, 0x00, 0x00, 0x03],
 };
 
+/// virtio-fs's **well-known** device type id (`872270E1-A899-4AF6-B454-7193634435AD`,
+/// WSL's `VIRTIO_FS_DEVICE_ID`) — the `DeviceClassId`/`EmulatorId` **every** virtio-fs
+/// `FlexibleIov` device must use. This is the platform-mandated class for the
+/// device-per-share model: the hotplug spike found a *custom* class id works for one
+/// device but the VID rejects a **second** with `ERROR_HV_INVALID_PARAMETER`, whereas
+/// the well-known id lets N devices coexist (distinguished only by a unique instance
+/// id), exactly as WSL's single `wsldevicehost` carries N virtio-fs devices.
+pub const VIRTIO_FS_DEVICE_CLASS_ID: sys::GUID = sys::GUID {
+    Data1: 0x872270E1,
+    Data2: 0xA899,
+    Data3: 0x4AF6,
+    Data4: [0xB4, 0x54, 0x71, 0x93, 0x63, 0x44, 0x35, 0xAD],
+};
+
 /// Format a GUID in canonical lowercase `8-4-4-4-12` form (no braces) — the form
 /// the HCS schema uses for `FlexibleIov` device keys and `EmulatorId`.
 pub fn guid_to_string(g: &sys::GUID) -> String {
@@ -75,6 +89,35 @@ pub fn guid_to_string(g: &sys::GUID) -> String {
         g.Data4[6],
         g.Data4[7],
     )
+}
+
+/// Parse a canonical `8-4-4-4-12` GUID string (case-insensitive; optional surrounding
+/// braces) into a [`sys::GUID`]; `None` on any malformed input. The inverse of
+/// [`guid_to_string`] — used to accept a caller-supplied `DeviceInstanceId` over the
+/// C ABI and re-emit it in canonical form for the HCS document.
+pub fn guid_from_string(s: &str) -> Option<sys::GUID> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .unwrap_or(s);
+    let p: Vec<&str> = s.split('-').collect();
+    if p.len() != 5
+        || [8, 4, 4, 4, 12] != [p[0].len(), p[1].len(), p[2].len(), p[3].len(), p[4].len()]
+    {
+        return None;
+    }
+    let mut data4 = [0u8; 8];
+    let tail = format!("{}{}", p[3], p[4]); // the 8 trailing bytes, as 16 hex digits
+    for (i, b) in data4.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(sys::GUID {
+        Data1: u32::from_str_radix(p[0], 16).ok()?,
+        Data2: u16::from_str_radix(p[1], 16).ok()?,
+        Data3: u16::from_str_radix(p[2], 16).ok()?,
+        Data4: data4,
+    })
 }
 
 /// The PCI identity + probed BAR sizes a device reports to HDV's `GetDetails`.
@@ -360,11 +403,13 @@ impl PciDevice {
     /// Like [`create_with_instance`](Self::create_with_instance) but on a **shared**
     /// device host and with a caller-chosen `class_id` (`DeviceClassId`/`EmulatorId`),
     /// so several devices can live on the one host HDV permits per VM (the hotplug
-    /// spike's multi-share model). Each concurrent device needs a **distinct
-    /// `class_id`** — the VID rejects a second `FlexibleIov` slot that reuses an
-    /// `EmulatorId` with `ERROR_HV_INVALID_PARAMETER` (WSL likewise gives each of its
-    /// virtiofs/net/pmem emulators its own class GUID). The caller keeps the `Arc`
-    /// and hands a clone per device; the host is torn down when the last clone drops.
+    /// spike's multi-share model). For >1 concurrent virtio-fs device the `class_id`
+    /// must be the **well-known** [`VIRTIO_FS_DEVICE_CLASS_ID`]: the spike found a
+    /// *custom* class works for one device but the VID rejects a second with
+    /// `ERROR_HV_INVALID_PARAMETER`, while the well-known id lets N coexist
+    /// (distinguished only by `instance_id`), as WSL's single `wsldevicehost` does.
+    /// The caller keeps the `Arc` and hands a clone per device; the host — and every
+    /// device on it — is torn down when the last clone drops.
     pub fn create_shared(
         host: Arc<DeviceHost>,
         ops: Box<dyn PciOps>,

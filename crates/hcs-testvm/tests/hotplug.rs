@@ -20,6 +20,7 @@
 //!      partition;
 //!   2. `vm.modify()` — `HcsModifyComputeSystem` **Add** the `FlexibleIov` slot,
 //!      whose `DeviceInstanceId` resolves to the just-created device.
+//!
 //! The guest's hotplug-watch loop (`E:\dev\spike\init`) mounts the tag and prints
 //! `HOTPLUG_MOUNT_PASS tag=hp1`.
 //!

@@ -9,16 +9,20 @@ in-box device support.
 It is the open counterpart to the device-host glue that ships **closed** inside
 WSL's `wsldevicehost.dll`.
 
-> **Status: it works through the C ABI.** A stock Rocky Linux 10 (EL10) guest under
-> Hyper-V/HCS **mounts a host directory over our HDV virtio-fs bridge** — reads a
-> host file and writes one back — with no 9p and no kernel changes, driven entirely
-> through the exported `hvfs_attach` (`hcs-testvm/tests/attach_abi.rs`,
-> `PROOF_COMPLETE_PASS`). The transport (`virtio-hdv`) drives OpenVMM's public
+> **Status: it works through the C ABI, including live multi-share.** A stock Rocky
+> Linux 10 (EL10) guest under Hyper-V/HCS **mounts a host directory over our HDV
+> virtio-fs bridge** — reads a host file and writes one back — with no 9p and no
+> kernel changes, driven entirely through the exported ABI
+> (`hcs-testvm/tests/attach_abi.rs`). Shares are **hot-added live** to a running VM,
+> one virtio-fs device per share (`hvfs_add_share`), so a host can map new directories
+> on the fly. The transport (`virtio-hdv`) drives OpenVMM's public
 > `VirtioPciDevice`/`VirtioFsDevice` over the `ExternalRestricted` FlexibleIov proxy
-> path. Remaining for product use: live `set_shares`, caller-supplied device GUIDs,
-> and a fully coherent guest-memory mapping (HDV apertures are an evictable cache;
-> the proof uses a persistent mapping + interrupt re-arm + boot retry to mask the
-> residual staleness). See [Roadmap](#roadmap).
+> path. Remaining for product use: live share **removal** (the platform refuses
+> `FlexibleIov` Remove — devices are reclaimed at VM teardown, as WSL does; see
+> [`docs/share-abi.md`](docs/share-abi.md)), `ro` enforcement, and a fully coherent
+> guest-memory mapping (HDV apertures are an evictable cache; the proof uses a
+> persistent mapping + interrupt re-arm + boot retry to mask the residual staleness).
+> See [Roadmap](#roadmap).
 
 ## Why
 
@@ -34,14 +38,23 @@ design notes).
 
 The product's entire contract is the C ABI in
 [`include/hyperv_virtiofs.h`](include/hyperv_virtiofs.h). It contains **no**
-consumer-specific concepts — its vocabulary is purely *compute systems, tags,
-directory maps, read-only*. Any host can drive it.
+consumer-specific concepts — its vocabulary is purely *compute systems, device hosts,
+shares, tags, read-only*. It names the real shape of the stack — a **device host**
+carrying **N hot-added virtio-fs devices** (one per share) — rather than imitating any
+one consumer's share semantics. Any host can drive it. Full design + rationale:
+[`docs/share-abi.md`](docs/share-abi.md).
 
 ```c
-uint32_t hvfs_abi_version(void);
-int32_t  hvfs_attach(const char *hcs_system_id, const char *device_json, hvfs_device **out);
-int32_t  hvfs_set_shares(hvfs_device *dev, const char *shares_json);  // {"ws":{"path":..,"ro":..}}
-int32_t  hvfs_detach(hvfs_device *dev);
+uint32_t hvfs_abi_version(void);  // 2
+// Register the single HDV device host against a compute system (BEFORE start).
+int32_t  hvfs_host_open(const char *hcs_system_id, const char *host_json, hvfs_host **out);
+// Hot-add one virtio-fs device == one share (AFTER start). One handle per share.
+int32_t  hvfs_add_share(hvfs_host *host, const char *share_json, hvfs_share **out);
+const char *hvfs_share_instance_id(const hvfs_share *share);  // the on-wire DeviceInstanceId
+// Best-effort live remove (UNSUPPORTED on current Windows -> reclaim at teardown).
+int32_t  hvfs_remove_share(hvfs_share *share);
+// Tear down every device + the host + the system handle.
+int32_t  hvfs_host_close(hvfs_host *host);
 const char *hvfs_last_error(void);
 void     hvfs_set_logger(hvfs_log_fn cb, void *ctx);
 ```
@@ -51,20 +64,20 @@ Contract rules: `0` = OK / `< 0` = error (details in the thread-local
 `free`); and **no Rust panic ever crosses the boundary** — every entry point runs
 under `catch_unwind` and returns `HVFS_ERR_PANIC` instead of aborting the host.
 
-`hvfs_attach`'s `device_json` carries the initial share + guest memory:
+`hvfs_host_open`'s `host_json` is just the guest RAM (`{ "memory_mb": 512 }`, the GPA
+ceiling each device's DMA may reference; it must equal the compute system's RAM). The
+caller's create document declares **no** `FlexibleIov` slots — shares are hot-added at
+runtime. `hvfs_add_share`'s `share_json` is one share:
 
 ```json
-{ "tag": "ws", "path": "C:\\host\\dir", "ro": false, "memory_mb": 512 }
+{ "tag": "ws", "path": "C:\\host\\dir", "instance_id": "c1c1c1c1-3333-4333-8333-333333333333", "ro": false }
 ```
 
 `tag` is the virtio-fs mount tag (`mount -t virtiofs <tag> …`), `path` the host
-directory, `ro` is accepted but **not yet enforced**, and `memory_mb` must equal the
-compute system's RAM (the GPA ceiling the device's DMA may reference). The caller's
-own compute-system document **must pre-declare a `FlexibleIov` slot** whose map-key
-GUID is the well-known `HVFS_DEVICE_INSTANCE_ID` and whose `EmulatorId` is
-`HVFS_DEVICE_CLASS_ID`, with `HostingModel: "ExternalRestricted"` (both GUIDs live in
-`hdv::pci`). Those device GUIDs are fixed product constants today — see the
-caller-supplied-GUIDs follow-up in the [Roadmap](#roadmap).
+directory, and `instance_id` the device's **required** unique `DeviceInstanceId` (the
+caller owns uniqueness; the device *class* is the well-known virtio-fs id by platform
+necessity, not caller-chosen). `ro: true` currently returns `HVFS_ERR_NOT_IMPLEMENTED`
+— read-only is not yet enforced and the ABI won't claim a guarantee it can't keep.
 
 ## Crate layering
 
@@ -142,21 +155,29 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
   BAR bases, since the VMBus VID owns guest-facing BAR placement). Drives the reused
   `VirtioFsDevice`; the guest mounts and does file I/O. (`shmem_size = 0` → no DAX
   BAR yet.)
-- [x] **Wire `hvfs_attach`** — the cdylib opens the compute system
-  (`HcsOpenComputeSystem`), proxy-registers an HDV device host, and calls
-  `VirtioHdvDevice::attach`; a guest mounts the share via `device_json` through the
-  shipped ABI (`hcs-testvm/tests/attach_abi.rs`, `PROOF_COMPLETE_PASS`). The initial
-  share rides in `device_json` (live updates are `set_shares`, below).
-- [ ] **Caller-supplied device GUIDs** — today host/class/instance are built-in
-  well-known constants (`hdv::pci`) the consumer must mirror in its `FlexibleIov`
-  slot, so only one such device can exist per guest. Let the host override them via
-  `device_json`, threading the ids through `attach` / `from_proxy` /
-  `PciDevice::create`.
+- [x] **Wire the C ABI (host/share, v2)** — the cdylib opens the compute system
+  (`HcsOpenComputeSystem`), proxy-registers one HDV device host (`hvfs_host_open`),
+  and **hot-adds a virtio-fs device per share at runtime** (`hvfs_add_share` →
+  `HcsModifyComputeSystem` Add); a guest hot-mounts each share through the shipped ABI
+  (`hcs-testvm/tests/attach_abi.rs`). Multiple shares coexist on one VM via the
+  well-known virtio-fs class id + a caller-supplied unique instance id. Full design:
+  [`docs/share-abi.md`](docs/share-abi.md).
+- [ ] **Live share removal** — `hvfs_remove_share` issues `FlexibleIov` Remove, but the
+  platform refuses it on current Windows (`ERROR_NOT_SUPPORTED`; WSL hits the same wall
+  and reclaims devices at VM shutdown). The DLL reports `HVFS_ERR_UNSUPPORTED` and
+  releases host-side resources; the guest device persists until the compute system is
+  torn down. Revisit if/when the platform adds hot-remove (`docs/hotplug-spike.md`).
+- [ ] **Caller-supplied class/host GUIDs** — the *instance* id is already caller-chosen
+  (`hvfs_add_share`); the device *class* is fixed to the well-known virtio-fs id (the
+  platform requires it for >1 device) and the device-**host** id is a built-in
+  constant. Let the host override the host id (e.g. to coexist with another device
+  host) where the platform allows.
+- [ ] **`ro` enforcement** — honor `ro: true` in the FUSE backend (today it is
+  honestly refused with `HVFS_ERR_NOT_IMPLEMENTED`), with a Windows reparse/junction-
+  safe directory jail.
 - [ ] **Coherent guest memory** — participate in HDV's aperture eviction protocol
   (à la WSL's `HdvGuestMemoryEvictionWorker`) for a fully coherent, zero-copy mapping
   (replacing the persistent-aperture + re-arm + retry mitigation).
-- [ ] **`set_shares`** — live directory-map updates with a Windows reparse/junction-
-  safe directory jail.
 
 ## License
 

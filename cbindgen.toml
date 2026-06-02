@@ -11,7 +11,7 @@ sys_includes = ["stdint.h"]
 no_includes = true
 
 [export]
-include = ["hvfs_device"]
+include = ["hvfs_host", "hvfs_share"]
 prefix = ""
 
 [defines]

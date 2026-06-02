@@ -3,31 +3,42 @@
 //! OpenVMM virtio-fs device to an externally-owned HCS/Hyper-V guest over HDV.
 //!
 //! It contains **no** consumer concepts (no Atelier, no sessions, no broker). Its
-//! vocabulary is purely virtio-fs/HDV: compute systems, tags, directory maps,
+//! vocabulary is purely virtio-fs/HDV: compute systems, device hosts, shares, tags,
 //! read-only. Any host can drive it via the C ABI; Atelier binds it with Go's
 //! `syscall.NewLazyDLL` (no cgo), exactly as it binds `computecore.dll`.
 //!
 //! ## ABI contract (mirrored in `include/hyperv_virtiofs.h`)
 //! - Every function returns `i32`: `0` = OK, `< 0` = error; on error,
 //!   [`hvfs_last_error`] holds a thread-local message.
-//! - Handles are opaque (`hvfs_device*`), never passed by value.
+//! - Handles are opaque (`hvfs_host*`, `hvfs_share*`), never passed by value.
 //! - Every `*const c_char` is **borrowed**: the caller owns inputs; outputs are
 //!   thread-local or delivered via the logger callback. Nothing crosses the
 //!   allocator boundary, so there is no `free` footgun.
 //! - **No panic ever crosses the boundary**: every entry point runs inside
 //!   [`catch_unwind`]; a panic becomes [`HVFS_ERR_PANIC`].
 //!
-//! Status: `attach`/`detach` are live — `hvfs_attach` opens the compute system,
-//! registers an HDV device host over the ExternalRestricted proxy path, and
-//! attaches an OpenVMM virtio-fs device, so a guest mounts the share through this
-//! ABI. `hvfs_set_shares` still returns [`HVFS_ERR_NOT_IMPLEMENTED`] (live re-share
-//! is a follow-up; the initial share comes in via `device_json`).
+//! ## Object model (the real shape of the stack — `docs/share-abi.md`)
+//! A [`hvfs_host`] is one HDV **device host** registered against an externally-owned
+//! compute system (one per VM — the platform rejects a second). N [`hvfs_share`]s
+//! ride it, each a **virtio-fs device == one shared directory**, hot-added to the
+//! running guest. The ABI exposes this directly rather than imitating any one
+//! consumer's share semantics:
+//! - [`hvfs_host_open`] registers the device host (before the system is started);
+//! - [`hvfs_add_share`] hot-adds one device per share (after start);
+//! - [`hvfs_remove_share`] is best-effort: live `FlexibleIov` Remove is unsupported
+//!   on current Windows, so it returns [`HVFS_ERR_UNSUPPORTED`] and the guest device
+//!   is reclaimed when the compute system is torn down (`hvfs_host_close` + the
+//!   caller stopping the VM) — the same reclaim-at-recycle WSL relies on;
+//! - [`hvfs_host_close`] tears down every device, the host, and the system handle.
 
 // The public type names mirror the C ABI (snake_case) on purpose.
 #![allow(non_camel_case_types)]
 
-use hcs_sys::{HcsCloseComputeSystem, HcsOpenComputeSystem, GENERIC_ALL, HCS_SYSTEM};
-use hdv::pci::HVFS_DEVICE_HOST_ID;
+use hcs_sys::{
+    HcsCloseComputeSystem, HcsCloseOperation, HcsCreateOperation, HcsModifyComputeSystem,
+    HcsOpenComputeSystem, HcsWaitForOperationResult, GENERIC_ALL, HCS_SYSTEM,
+};
+use hdv::pci::{guid_from_string, guid_to_string, HVFS_DEVICE_HOST_ID, VIRTIO_FS_DEVICE_CLASS_ID};
 use hdv::proxy::DeviceHostSupport;
 use hdv::DeviceHost;
 use serde::Deserialize;
@@ -36,10 +47,13 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use virtio_hdv::VirtioHdvDevice;
 
 /// Bump on any breaking change to the C ABI. The consumer checks this at load.
-pub const HVFS_ABI_VERSION: u32 = 1;
+/// v2: the device-bundled `hvfs_attach`/`hvfs_set_shares`/`hvfs_detach` surface was
+/// replaced by the host/share model (`hvfs_host_open` + `hvfs_add_share` + …).
+pub const HVFS_ABI_VERSION: u32 = 2;
 
 // Status codes. Keep in sync with the header.
 pub const HVFS_OK: i32 = 0;
@@ -47,6 +61,14 @@ pub const HVFS_ERR_INVALID_ARG: i32 = -1;
 pub const HVFS_ERR_NOT_IMPLEMENTED: i32 = -2;
 pub const HVFS_ERR_PANIC: i32 = -3;
 pub const HVFS_ERR_HDV: i32 = -4;
+/// The platform refused the operation (e.g. live `FlexibleIov` Remove). Distinct from
+/// [`HVFS_ERR_NOT_IMPLEMENTED`] (which means *this DLL* hasn't built it): the request
+/// is well-formed and the DLL tried, but Windows said no.
+pub const HVFS_ERR_UNSUPPORTED: i32 = -5;
+
+/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` — what `HcsModifyComputeSystem` Remove
+/// returns for a `FlexibleIov` device on current Windows.
+const HRESULT_NOT_SUPPORTED: i32 = 0x8007_0032u32 as i32;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -86,26 +108,75 @@ fn cstr<'a>(p: *const c_char, what: &str) -> Result<&'a str, i32> {
     }
 }
 
-/// The `device_json` contract for [`hvfs_attach`] — the initial single share plus
-/// the guest RAM size. (Live multi-share updates are [`hvfs_set_shares`]'s job,
-/// still a follow-up.)
+/// The `host_json` contract for [`hvfs_host_open`].
 #[derive(Deserialize)]
-struct DeviceConfig {
+struct HostConfig {
+    /// Guest RAM in MiB — the GPA ceiling each device's virtqueues may reference.
+    /// Supplied by the caller because `HcsGetComputeSystemProperties` isn't bound; it
+    /// must match the compute system's actual memory.
+    memory_mb: u64,
+}
+
+/// The `share_json` contract for [`hvfs_add_share`].
+#[derive(Deserialize)]
+struct ShareConfig {
     /// virtio-fs mount tag the guest uses: `mount -t virtiofs <tag> …`.
     tag: String,
     /// Host directory to share.
     path: String,
-    /// Read-only request. Accepted but **not yet enforced** by the FUSE backend.
+    /// The device's unique `DeviceInstanceId` (canonical `8-4-4-4-12` GUID). Caller
+    /// owns uniqueness across the compute system; the device *class* is fixed (the
+    /// well-known virtio-fs id). A collision is rejected by the VID.
+    instance_id: String,
+    /// Read-only request. `true` currently returns [`HVFS_ERR_NOT_IMPLEMENTED`] — the
+    /// FUSE backend does not yet enforce read-only, and the ABI won't claim a
+    /// guarantee it can't keep.
     #[serde(default)]
     ro: bool,
-    /// Guest RAM in MiB — the GPA ceiling the virtqueues may reference. Supplied by
-    /// the caller because `HcsGetComputeSystemProperties` isn't bound; it must match
-    /// the compute system's actual memory.
-    memory_mb: u64,
+}
+
+/// Build an HCS `ModifySettingRequest` that adds (`Add`) or removes (`Remove`) a
+/// `FlexibleIov` device slot keyed by `instance_id`, with the virtio-fs `EmulatorId`.
+/// WSL's `DeviceHostProxy` sends the same `Settings` for both Add and Remove.
+fn slot_request(request_type: &str, instance_id: &str, emulator_id: &str) -> String {
+    serde_json::json!({
+        "ResourcePath": format!("VirtualMachine/Devices/FlexibleIov/{instance_id}"),
+        "RequestType": request_type,
+        "Settings": { "EmulatorId": emulator_id, "HostingModel": "ExternalRestricted" },
+    })
+    .to_string()
+}
+
+/// Drive one `HcsModifyComputeSystem` to completion. Returns the failing `HRESULT`
+/// (sync return *or* async operation result) so callers can distinguish a platform
+/// refusal (`HRESULT_NOT_SUPPORTED`) from a real error.
+///
+/// # Safety
+/// `system` must be a live compute-system handle for the duration of the call.
+unsafe fn hcs_modify(system: HCS_SYSTEM, request: &str) -> Result<(), i32> {
+    // SAFETY: `system` is live (caller contract); `op` is created/closed here; the
+    // request wide-string outlives the synchronous `HcsModifyComputeSystem` call.
+    unsafe {
+        let op = HcsCreateOperation(ptr::null(), None);
+        if op.is_null() {
+            return Err(0); // 0 is not a real failing HRESULT — signals op-create failure
+        }
+        let hr = HcsModifyComputeSystem(system, op, wide(request).as_ptr(), ptr::null_mut());
+        let mut result: hcs_sys::PWSTR = ptr::null_mut();
+        let whr = HcsWaitForOperationResult(op, 30_000, &mut result);
+        HcsCloseOperation(op);
+        if hr < 0 {
+            return Err(hr);
+        }
+        if whr < 0 {
+            return Err(whr);
+        }
+        Ok(())
+    }
 }
 
 /// RAII for an opened `HCS_SYSTEM`: closes it on drop, so every early return in
-/// [`hvfs_attach`] releases the handle and the device's teardown closes it last.
+/// [`hvfs_host_open`] releases the handle and the host's teardown closes it last.
 struct OwnedSystem(HCS_SYSTEM);
 
 impl Drop for OwnedSystem {
@@ -122,22 +193,56 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Opaque device handle. Box-allocated; freed by [`hvfs_detach`].
-pub struct hvfs_device {
-    // Field order = drop order. The HDV device must tear down *before* the COM
-    // support object it was registered through, and *before* the HCS handle closes.
-    _device: VirtioHdvDevice,
+/// Opaque **device-host** handle: one per compute system, owning the single HDV
+/// device host the platform permits and the shares opened on it. Box-allocated;
+/// freed by [`hvfs_host_close`].
+pub struct hvfs_host {
+    // Field order = drop order, and it is load-bearing: shares (their HDV devices)
+    // tear down before the device host, which tears down before the COM support
+    // object it was registered through, which releases before the HCS handle closes.
+    shares: Mutex<Vec<*mut hvfs_share>>,
+    host: Arc<DeviceHost>,
+    /// Held only to keep the `IVmDeviceHostSupport` COM object alive for the device
+    /// host's lifetime (released, never called back into, on drop).
     _support: DeviceHostSupport,
-    _system: OwnedSystem,
+    owned: OwnedSystem,
+    /// Per-device aperture ceiling (the compute system's RAM in bytes).
+    memory_bytes: u64,
 }
 
-// SAFETY: the handle is returned to C as an opaque pointer and may be detached from
-// a different thread than the one that attached it. Everything it owns is a
-// process-global, thread-agnostic handle — the HDV device/host, the `HCS_SYSTEM`,
-// and the `IVmDeviceHostSupport` COM object — none tied to a thread; on drop the
-// support object is only released, never called back into. So moving the box across
-// threads is sound.
-unsafe impl Send for hvfs_device {}
+impl hvfs_host {
+    fn system(&self) -> HCS_SYSTEM {
+        self.owned.0
+    }
+}
+
+/// Opaque **share** handle: one virtio-fs device == one shared directory, hot-added
+/// to the running guest. Borrows its [`hvfs_host`] (the host must outlive it). Freed
+/// by [`hvfs_remove_share`], or reclaimed by [`hvfs_host_close`].
+pub struct hvfs_share {
+    /// The HDV virtio-fs device; holds a clone of the host's `Arc<DeviceHost>`, so the
+    /// device host stays alive at least as long as this share.
+    _device: VirtioHdvDevice,
+    /// The host's compute-system handle, borrowed for this share's own Remove. Valid
+    /// while the host is open (the contract).
+    system: HCS_SYSTEM,
+    /// Back-reference to the owning host, to de-register on remove. Never dereferenced
+    /// during the share's own `Drop` (only by `hvfs_remove_share`, while the host is
+    /// guaranteed open).
+    host: *const hvfs_host,
+    /// Canonical `DeviceInstanceId` and `EmulatorId` GUID strings, for the getter and
+    /// the Remove request.
+    instance_id: CString,
+    emulator_id: CString,
+}
+
+// SAFETY: both handles are returned to C as opaque pointers and may be used from a
+// different thread than the one that created them. Everything they own is a
+// process-global, thread-agnostic handle — the HDV device/host, the `HCS_SYSTEM`, and
+// the `IVmDeviceHostSupport` COM object — none tied to a thread; the share registry is
+// behind a `Mutex`. So moving the boxes across threads is sound.
+unsafe impl Send for hvfs_host {}
+unsafe impl Send for hvfs_share {}
 
 /// Returns the ABI version the DLL implements. Call right after load; refuse on
 /// mismatch with [`HVFS_ABI_VERSION`] in the header you compiled against.
@@ -146,29 +251,25 @@ pub extern "C" fn hvfs_abi_version() -> u32 {
     HVFS_ABI_VERSION
 }
 
-/// Attach a virtio-fs device to an externally-owned HCS compute system, by id.
-/// Non-blocking: serving runs on the DLL's own threads. On success `*out` holds a
-/// handle to pass to [`hvfs_set_shares`] / [`hvfs_detach`].
+/// Register an HDV device host against an externally-owned HCS compute system, by id.
+/// Exactly one device host is permitted per compute system; every share rides it.
+/// On success `*out` holds a [`hvfs_host`] handle for [`hvfs_add_share`] /
+/// [`hvfs_host_close`].
 ///
-/// `device_json` is the initial share + guest memory:
-/// `{ "tag": "ws", "path": "C:\\host\\dir", "ro": false, "memory_mb": 512 }`
-/// — `tag` is the virtio-fs mount tag, `path` the host directory, `ro` is accepted
-/// but not yet enforced, and `memory_mb` must equal the compute system's RAM.
-///
-/// The caller's compute-system document **must** pre-declare a `FlexibleIov` slot
-/// whose map-key GUID is the well-known `HVFS_DEVICE_INSTANCE_ID` and whose
-/// `EmulatorId` is `HVFS_DEVICE_CLASS_ID`, `HostingModel` `"ExternalRestricted"`
-/// (see `hdv::pci`). Those device GUIDs are fixed today — making them caller-chosen
-/// is a tracked follow-up.
+/// **Call before the compute system is started** — the device host is registered at
+/// VM bringup (as WSL does). `host_json` is `{ "memory_mb": 512 }`, the system's RAM
+/// (the GPA ceiling each device's virtqueues may reference; it must equal the system's
+/// actual memory). The caller's create document must declare **no** `FlexibleIov`
+/// slots — shares are hot-added at runtime by [`hvfs_add_share`].
 ///
 /// # Safety
-/// `hcs_system_id` and `device_json` must be valid NUL-terminated C strings;
-/// `out` must be a valid, writable `*mut *mut hvfs_device`.
+/// `hcs_system_id` and `host_json` must be valid NUL-terminated C strings; `out` must
+/// be a valid, writable `*mut *mut hvfs_host`.
 #[no_mangle]
-pub unsafe extern "C" fn hvfs_attach(
+pub unsafe extern "C" fn hvfs_host_open(
     hcs_system_id: *const c_char,
-    device_json: *const c_char,
-    out: *mut *mut hvfs_device,
+    host_json: *const c_char,
+    out: *mut *mut hvfs_host,
 ) -> i32 {
     guard(|| {
         if out.is_null() {
@@ -182,25 +283,19 @@ pub unsafe extern "C" fn hvfs_attach(
             Ok(s) => s,
             Err(e) => return e,
         };
-        let device_json = match cstr(device_json, "device_json") {
+        let host_json = match cstr(host_json, "host_json") {
             Ok(s) => s,
             Err(e) => return e,
         };
-
-        // TODO(caller-guids): device GUIDs (host/class/instance) are the fixed
-        // well-known constants in `hdv::pci`; the consumer must mirror them in its
-        // FlexibleIov slot. Tracked follow-up: accept overrides here in device_json.
-        let cfg: DeviceConfig = match serde_json::from_str(device_json) {
+        let cfg: HostConfig = match serde_json::from_str(host_json) {
             Ok(c) => c,
             Err(e) => {
-                set_last_error(format!("device_json parse error: {e}"));
+                set_last_error(format!("host_json parse error: {e}"));
                 return HVFS_ERR_INVALID_ARG;
             }
         };
-        let _ = cfg.ro; // accepted but not yet enforced (see doc comment)
 
-        // Turn the caller's system id into a live HCS_SYSTEM handle, wrapped at once
-        // so any early return below closes it.
+        // Open the caller's system, wrapped at once so any early return closes it.
         let mut system: HCS_SYSTEM = ptr::null_mut();
         let idw = wide(id);
         // SAFETY: `idw` is a valid NUL-terminated wide string; `system` is a valid out ptr.
@@ -214,9 +309,8 @@ pub unsafe extern "C" fn hvfs_attach(
         }
         let owned = OwnedSystem(system);
 
-        // Register an HDV device host against that system over the proven
-        // ExternalRestricted proxy path, then create the virtio-fs device on it.
-        // SAFETY: `owned` (hence the system handle) outlives `support` and the device.
+        // Register the single HDV device host over the ExternalRestricted proxy path.
+        // SAFETY: `owned` (hence the system handle) outlives `support` and the host.
         let support = unsafe { DeviceHostSupport::new(owned.0) };
         // SAFETY: HVFS_DEVICE_HOST_ID is a live GUID constant; `support` is a live
         // IVmDeviceHostSupport that outlives the returned device host.
@@ -229,11 +323,93 @@ pub unsafe extern "C" fn hvfs_attach(
                 }
             };
 
-        let device = match VirtioHdvDevice::attach(
-            host,
+        let h = Box::new(hvfs_host {
+            shares: Mutex::new(Vec::new()),
+            host: Arc::new(host),
+            _support: support,
+            owned,
+            memory_bytes: cfg.memory_mb.saturating_mul(1024 * 1024),
+        });
+        // SAFETY: `out` checked non-null above and guaranteed writable by the caller.
+        unsafe { *out = Box::into_raw(h) };
+        HVFS_OK
+    })
+}
+
+/// Hot-add one virtio-fs device (== one shared directory) to the **running** compute
+/// system. On success `*out` holds a [`hvfs_share`] handle.
+///
+/// `share_json` is `{ "tag": "ws", "path": "C:\\host\\dir", "instance_id": "<guid>",
+/// "ro": false }` — `tag` is the virtio-fs mount tag, `path` the host directory,
+/// `instance_id` the device's **required** unique `DeviceInstanceId` (the caller owns
+/// uniqueness; the device class is the well-known virtio-fs id, not caller-chosen).
+/// `ro: true` currently returns [`HVFS_ERR_NOT_IMPLEMENTED`] (read-only is not yet
+/// enforced).
+///
+/// # Safety
+/// `host` must be a live handle from [`hvfs_host_open`]; `share_json` a valid
+/// NUL-terminated C string; `out` a valid, writable `*mut *mut hvfs_share`.
+#[no_mangle]
+pub unsafe extern "C" fn hvfs_add_share(
+    host: *mut hvfs_host,
+    share_json: *const c_char,
+    out: *mut *mut hvfs_share,
+) -> i32 {
+    guard(|| {
+        if out.is_null() {
+            set_last_error("null out parameter");
+            return HVFS_ERR_INVALID_ARG;
+        }
+        // SAFETY: checked non-null above; caller guarantees writability.
+        unsafe { *out = ptr::null_mut() };
+        if host.is_null() {
+            set_last_error("null host handle");
+            return HVFS_ERR_INVALID_ARG;
+        }
+        // SAFETY: caller contract — `host` came from hvfs_host_open and is still open.
+        let h = unsafe { &*host };
+
+        let share_json = match cstr(share_json, "share_json") {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let cfg: ShareConfig = match serde_json::from_str(share_json) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("share_json parse error: {e}"));
+                return HVFS_ERR_INVALID_ARG;
+            }
+        };
+        if cfg.ro {
+            set_last_error(
+                "ro:true not supported — the FUSE backend does not yet enforce read-only",
+            );
+            return HVFS_ERR_NOT_IMPLEMENTED;
+        }
+        // Parse the caller-supplied instance id and canonicalize it, so the device,
+        // the FlexibleIov slot key, and the stored handle all agree byte-for-byte.
+        let instance_guid = match guid_from_string(&cfg.instance_id) {
+            Some(g) => g,
+            None => {
+                set_last_error(format!(
+                    "instance_id is not a valid GUID: {}",
+                    cfg.instance_id
+                ));
+                return HVFS_ERR_INVALID_ARG;
+            }
+        };
+        let instance_str = guid_to_string(&instance_guid);
+        let emulator_str = guid_to_string(&VIRTIO_FS_DEVICE_CLASS_ID);
+
+        // (1) Create the HDV virtio-fs device on the shared host. The well-known class
+        // id is what lets multiple virtio-fs devices coexist (the hotplug spike).
+        let device = match VirtioHdvDevice::attach_shared(
+            h.host.clone(),
             Path::new(&cfg.path),
             &cfg.tag,
-            cfg.memory_mb.saturating_mul(1024 * 1024),
+            h.memory_bytes,
+            &VIRTIO_FS_DEVICE_CLASS_ID,
+            &instance_guid,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -242,54 +418,139 @@ pub unsafe extern "C" fn hvfs_attach(
             }
         };
 
-        let dev = Box::new(hvfs_device {
+        // (2) Hot-add the FlexibleIov slot; the VID resolves it to the device above.
+        let req = slot_request("Add", &instance_str, &emulator_str);
+        // SAFETY: the host (hence its system handle) is live for this call.
+        if let Err(hr) = unsafe { hcs_modify(h.system(), &req) } {
+            // The Add failed; drop the device we just created (host-side cleanup).
+            drop(device);
+            set_last_error(format!(
+                "HcsModifyComputeSystem Add FlexibleIov: HRESULT {:#010x}",
+                hr as u32
+            ));
+            return HVFS_ERR_HDV;
+        }
+
+        let share = Box::new(hvfs_share {
             _device: device,
-            _support: support,
-            _system: owned,
+            system: h.system(),
+            host: host as *const hvfs_host,
+            instance_id: CString::new(instance_str).unwrap_or_default(),
+            emulator_id: CString::new(emulator_str).unwrap_or_default(),
         });
+        let raw = Box::into_raw(share);
+        // Register so hvfs_host_close can reclaim a share the caller didn't remove.
+        if let Ok(mut v) = h.shares.lock() {
+            v.push(raw);
+        }
         // SAFETY: `out` checked non-null above and guaranteed writable by the caller.
-        unsafe { *out = Box::into_raw(dev) };
+        unsafe { *out = raw };
         HVFS_OK
     })
 }
 
-/// Replace the device's directory map. `shares_json` is `{"tag":{"path":..,
-/// "ro":bool}, ...}` — the moral equivalent of VZ's `SetShare`. Pushed live; an
-/// empty map detaches all directories without tearing the device down.
+/// The share's on-wire identity: its `FlexibleIov` `DeviceInstanceId` (canonical GUID
+/// string). Borrowed, valid for the share's lifetime, never freed by the caller.
+/// Returns NULL for a null handle.
 ///
 /// # Safety
-/// `dev` must be a handle from [`hvfs_attach`]; `shares_json` a valid C string.
+/// `share` must be NULL or a live handle from [`hvfs_add_share`].
 #[no_mangle]
-pub unsafe extern "C" fn hvfs_set_shares(dev: *mut hvfs_device, shares_json: *const c_char) -> i32 {
+pub unsafe extern "C" fn hvfs_share_instance_id(share: *const hvfs_share) -> *const c_char {
+    if share.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: caller contract — `share` is a live handle; the CString lives as long.
+    unsafe { (*share).instance_id.as_ptr() }
+}
+
+/// Best-effort live remove + host-side teardown of one share. Issues a `FlexibleIov`
+/// Remove; on current Windows the platform refuses it and this returns
+/// [`HVFS_ERR_UNSUPPORTED`] — the guest-visible device then persists until the compute
+/// system is torn down (reclaim-at-recycle), though host-side resources are released
+/// now. The share handle is **freed** on [`HVFS_OK`] and [`HVFS_ERR_UNSUPPORTED`]; on
+/// any other error the handle stays valid (retryable, and reclaimed by
+/// [`hvfs_host_close`]). A null handle is a no-op ([`HVFS_OK`]).
+///
+/// # Safety
+/// `share` must be NULL or a live handle from [`hvfs_add_share`], whose host is still
+/// open, and must not be used again after a freeing return.
+#[no_mangle]
+pub unsafe extern "C" fn hvfs_remove_share(share: *mut hvfs_share) -> i32 {
     guard(|| {
-        if dev.is_null() {
-            set_last_error("null device handle");
-            return HVFS_ERR_INVALID_ARG;
+        if share.is_null() {
+            return HVFS_OK;
         }
-        let _shares = match cstr(shares_json, "shares_json") {
-            Ok(s) => s,
-            Err(e) => return e,
+        // SAFETY: caller contract — live handle, host still open.
+        let s = unsafe { &*share };
+        let req = slot_request(
+            "Remove",
+            &s.instance_id.to_string_lossy(),
+            &s.emulator_id.to_string_lossy(),
+        );
+        // SAFETY: the share borrows a system handle live while its host is open.
+        let outcome = match unsafe { hcs_modify(s.system, &req) } {
+            Ok(()) => HVFS_OK,
+            Err(hr) if hr == HRESULT_NOT_SUPPORTED => {
+                set_last_error(
+                    "FlexibleIov live Remove unsupported on this Windows; \
+                     device reclaimed when the compute system is torn down",
+                );
+                HVFS_ERR_UNSUPPORTED
+            }
+            Err(hr) => {
+                set_last_error(format!(
+                    "HcsModifyComputeSystem Remove FlexibleIov: HRESULT {:#010x}",
+                    hr as u32
+                ));
+                HVFS_ERR_HDV
+            }
         };
-        // TODO(spike-3): parse + validate (jail each path, RESOLVE_BENEATH-equiv),
-        // then push the map into the running FUSE server.
-        set_last_error("hvfs_set_shares: not yet implemented");
-        HVFS_ERR_NOT_IMPLEMENTED
+
+        // Only free on success/unsupported; a genuine error leaves the handle valid.
+        if outcome == HVFS_OK || outcome == HVFS_ERR_UNSUPPORTED {
+            // De-register from the host (it outlives the share per contract).
+            if !s.host.is_null() {
+                // SAFETY: `s.host` points at a live hvfs_host (must outlive its shares).
+                if let Ok(mut v) = unsafe { (*s.host).shares.lock() } {
+                    v.retain(|&p| p != share);
+                }
+            }
+            // SAFETY: caller contract — `share` came from hvfs_add_share, freed once.
+            drop(unsafe { Box::from_raw(share) });
+        }
+        outcome
     })
 }
 
-/// Detach the device and free the handle. Idempotent-safe for a non-null handle
-/// obtained from [`hvfs_attach`]; joins the serving threads.
+/// Tear down every remaining share's device, then the device host, then close the
+/// compute-system handle. Invalidates all share handles opened on this host. A null
+/// handle is a no-op ([`HVFS_OK`]). Per-share live removal is not attempted here —
+/// the devices are reclaimed when the caller subsequently stops/terminates the VM.
 ///
 /// # Safety
-/// `dev` must be a handle from [`hvfs_attach`] and not used afterwards.
+/// `host` must be NULL or a live handle from [`hvfs_host_open`], not used afterwards;
+/// no share handle from it may be used after this call.
 #[no_mangle]
-pub unsafe extern "C" fn hvfs_detach(dev: *mut hvfs_device) -> i32 {
+pub unsafe extern "C" fn hvfs_host_close(host: *mut hvfs_host) -> i32 {
     guard(|| {
-        if dev.is_null() {
+        if host.is_null() {
             return HVFS_OK;
         }
-        // SAFETY: caller contract — `dev` came from hvfs_attach and is detached once.
-        drop(unsafe { Box::from_raw(dev) });
+        // SAFETY: caller contract — `host` came from hvfs_host_open and is closed once.
+        let h = unsafe { Box::from_raw(host) };
+        // Free any shares the caller didn't remove (drops their HDV device handles).
+        if let Ok(mut v) = h.shares.lock() {
+            for p in v.drain(..) {
+                if !p.is_null() {
+                    // SAFETY: each `p` is a live hvfs_share from hvfs_add_share, freed once.
+                    drop(unsafe { Box::from_raw(p) });
+                }
+            }
+        }
+        // Dropping `h` tears down the device host (last Arc ref), releases the COM
+        // support object, and closes the HCS handle — in that field order.
+        drop(h);
         HVFS_OK
     })
 }
@@ -308,7 +569,7 @@ pub extern "C" fn hvfs_last_error() -> *const c_char {
 /// Logger callback: `(level, message, ctx)`. `level` follows syslog severities.
 pub type hvfs_log_fn = Option<extern "C" fn(level: c_int, msg: *const c_char, ctx: *mut c_void)>;
 
-/// Install a process-global logger. Set once at load, before [`hvfs_attach`].
+/// Install a process-global logger. Set once at load, before [`hvfs_host_open`].
 ///
 /// # Safety
 /// `cb` must remain a valid function pointer for the process lifetime; `ctx` is
