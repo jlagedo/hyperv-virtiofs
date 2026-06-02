@@ -1,0 +1,15 @@
+[package]
+name = "hdv"
+description = "Safe RAII wrapper over the Windows HDV API (device host, instance, guest-memory apertures, doorbells)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hdv-sys = { path = "../hdv-sys" }
+
+[features]
+link-hdv = ["hdv-sys/link-hdv"]

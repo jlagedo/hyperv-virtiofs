@@ -1,0 +1,4 @@
+/target
+/dist
+**/*.gen.h
+# Cargo.lock IS committed — this workspace ships a binary (cdylib) product.

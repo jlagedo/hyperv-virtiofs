@@ -1,0 +1,4 @@
+hyperv-virtiofs reuses virtio device logic from Microsoft OpenVMM
+(https://github.com/microsoft/openvmm), MIT-licensed. The HDV transport bridge
+(crates hdv-sys, hdv, virtio-hdv) is original work — the open analog of the
+device-host glue that ships closed in WSL's wsldevicehost.dll.

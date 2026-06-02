@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hdv-sys",
+    "crates/hdv",
+    "crates/virtio-hdv",
+    "crates/hyperv_virtiofs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jlagedo/hyperv-virtiofs"
+authors = ["hyperv-virtiofs contributors"]
+rust-version = "1.80"
+
+# A panic must never abort across the C ABI boundary: the cdylib catches it
+# (std::panic::catch_unwind) and returns an error code instead. unwind is the
+# default, but pin it so a future profile change can't silently break the contract.
+[profile.release]
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"

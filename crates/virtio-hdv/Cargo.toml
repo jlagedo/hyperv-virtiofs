@@ -1,0 +1,21 @@
+[package]
+name = "virtio-hdv"
+description = "OpenVMM virtio transport carried over HDV: guest memory via apertures, queue-notify via doorbells, PCI config space. The open analog of WSL's wsldevicehost.dll."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hdv = { path = "../hdv" }
+
+# TODO(spike-2): add OpenVMM's transport crates once the seam is proven to accept
+# an external GuestMemory + queue-notify (design §7 unknown #2). Candidates:
+#   virtio       = { git = "https://github.com/microsoft/openvmm" }
+#   guestmem     = { git = "https://github.com/microsoft/openvmm" }
+# Vendored/pinned, not floating — these are not yet published to crates.io.
+
+[features]
+link-hdv = ["hdv/link-hdv"]

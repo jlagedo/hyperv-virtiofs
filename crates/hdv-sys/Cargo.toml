@@ -1,0 +1,17 @@
+[package]
+name = "hdv-sys"
+description = "Raw FFI declarations for the Windows Host Device Virtualization (HDV) API (vmdevicehost.dll)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+# Off by default so the workspace builds green without the HDV import library on
+# the link line. Flip on once the real attach handshake is wired (see design §7).
+link-hdv = []
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
