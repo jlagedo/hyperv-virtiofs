@@ -10,11 +10,19 @@ rust-version.workspace = true
 
 [dependencies]
 hdv = { path = "../hdv" }
+hdv-sys = { path = "../hdv-sys" }
 
 # Reused OpenVMM seam crates (the transport drives a VirtioDevice via these).
 virtio.workspace = true
+virtiofs.workspace = true
+pci_core.workspace = true
+chipset_device.workspace = true
 guestmem.workspace = true
 vmcore.workspace = true
 pal_event.workspace = true
 pal_async.workspace = true
 inspect.workspace = true
+
+# block_on for resolving the device's deferred config reads on the synchronous
+# HDV callback thread (the device task completes them from the pool thread).
+futures = "0.3"

@@ -15,6 +15,9 @@ serde_json = "1"
 # A normal (not dev) dependency so the out-of-process spike's child binary
 # (`src/bin/attach_child.rs`) can use it — `src/bin` targets can't see dev-deps.
 hdv = { path = "../hdv" }
+# The virtio-fs-over-HDV attach spike (`tests/attach_virtiofs.rs`) drives the real
+# OpenVMM transport instead of the trivial SpikeDevice.
+virtio-hdv = { path = "../virtio-hdv" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

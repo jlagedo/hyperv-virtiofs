@@ -1,41 +1,277 @@
-//! The interesting crate: OpenVMM's virtio transport, carried over HDV instead of
-//! over OpenVMM's own PCI/VPCI stack. This is the open counterpart to WSL's
-//! closed `wsldevicehost.dll` — the piece that lets *any* OpenVMM virtio device
-//! run as a host-side HDV device against a stock HCS guest.
+//! OpenVMM's virtio transport, carried over **HDV** instead of OpenVMM's own
+//! PCI/VPCI stack — the open counterpart to WSL's closed `wsldevicehost.dll`.
 //!
-//! Responsibilities:
-//!   - present a virtio PCI device's config space to the guest (via the `hdv`
-//!     device instance),
-//!   - back the device's `GuestMemory` with `hdv` guest-memory apertures,
-//!   - turn `hdv` doorbells into virtqueue kicks.
+//! [`VirtioHdvDevice::attach`] stands up a virtio-fs device on an HDV device
+//! host and presents it to a stock HCS guest. The flow:
 //!
-//! It is **device-neutral**: virtio-fs, virtio-blk, virtio-console all ride it.
-//! `hyperv_virtiofs` is the first consumer.
+//! 1. Build OpenVMM's public [`VirtioPciDevice`] fronting a [`VirtioFsDevice`]
+//!    (which fronts a host directory via [`VirtioFs`]).
+//! 2. Back its three host seams with HDV:
+//!    - guest memory ← `HdvReadGuestMemory`/`HdvWriteGuestMemory` ([`mem`]),
+//!    - MSI-X delivery ← `HdvDeliverGuestInterrupt` ([`interrupt`]),
+//!    - the PCI config space + BAR MMIO ← HDV's device-vtable callbacks, via the
+//!      generic [`hdv::pci::PciOps`] this crate implements below.
+//! 3. Create the device on the host through the proven [`hdv::pci`] /
+//!    [`hdv::proxy`] path and publish the HDV device handle (see [`handle`]).
 //!
-//! Status: SKELETON — milestone 2. The shape is now decided (design §7 unknown #2
-//! is **resolved**, see `windows-virtiofs-hdv.md` §4 "Correction²" + Appendix B):
-//! the generic HDV PCI device + callback vtable live in [`hdv::pci`]; this crate
-//! implements [`hdv::pci::PciOps`] by driving OpenVMM's **public** `VirtioPciDevice`
-//! — backing its `GuestMemory` with `hdv` apertures (via `GuestMemoryAccess`),
-//! its `DoorbellRegistration` with `HdvRegisterDoorbell`, its `PciInterruptModel`
-//! with `HdvDeliverGuestInterrupt`, and its `RegisterMmioIntercept` with the HDV
-//! BAR callbacks. The attach spike (`hcs-testvm`) exercises `hdv::pci` directly
-//! with a trivial device first; this crate fills in once that handshake is proven.
+//! **Scope (milestone 2, first proof):** no DAX — `shmem_size = 0`, so there is
+//! no shared-memory BAR and no `shared_mem_mapper` / `HdvCreateSectionBackedMmioRange`
+//! on the critical path. Notify rides the BAR0 MMIO intercept (no doorbell yet).
+//! Guest memory is copy-per-access; a zero-copy aperture backing is the perf
+//! follow-up. Both are deliberate simplifications, documented inline.
+//!
+//! [`VirtioPciDevice`]: virtio::VirtioPciDevice
+//! [`VirtioFsDevice`]: virtiofs::virtio::VirtioFsDevice
+//! [`VirtioFs`]: virtiofs::VirtioFs
 
+mod handle;
+mod interrupt;
+mod mem;
+
+pub use handle::DeviceHandle;
+
+use chipset_device::io::IoResult;
+use chipset_device::mmio::{ExternallyManagedMmioIntercepts, MmioIntercept};
+use chipset_device::pci::PciConfigSpace;
+use chipset_device::poll_device::PollDevice;
+use futures::executor::block_on;
+use hdv::pci::{PciDetails, PciDevice, PciOps};
 use hdv::DeviceHost;
+use interrupt::HdvSignalMsi;
+use mem::HdvGuestMemory;
+use pal_async::task::{Spawn, Task};
+use pal_async::{DefaultDriver, DefaultPool};
+use pci_core::bus_range::AssignedBusRange;
+use pci_core::msi::MsiConnection;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::thread::JoinHandle;
+use virtio::{PciInterruptModel, VirtioPciDevice};
+use virtiofs::virtio::VirtioFsDevice;
+use virtiofs::VirtioFs;
+use vmcore::vm_task::{SingleDriverBackend, VmTaskDriverSource};
 
-/// A virtio device presented to the guest over HDV. Generic over the OpenVMM
-/// device implementation it fronts (virtio-fs, etc.) once the seam is wired.
+/// Building or attaching the virtio-fs HDV device failed.
+#[derive(Debug)]
+pub enum AttachError {
+    /// Opening the host directory for the FUSE backend failed.
+    Fs(String),
+    /// Building the OpenVMM virtio PCI transport failed.
+    Transport(std::io::Error),
+    /// An HDV call (device-instance creation) failed.
+    Hdv(hdv::Error),
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachError::Fs(e) => write!(f, "virtio-fs backend: {e}"),
+            AttachError::Transport(e) => write!(f, "virtio PCI transport: {e}"),
+            AttachError::Hdv(e) => write!(f, "HDV: {e}"),
+        }
+    }
+}
+impl std::error::Error for AttachError {}
+
+/// A live virtio-fs device attached to a guest over HDV. Holds the HDV device
+/// (whose drop tears it down) plus, inside its `PciOps` context, every object
+/// that must outlive it (the async pool, the device, the poll pump).
 pub struct VirtioHdvDevice {
-    _host: DeviceHost,
+    // `PciDevice`'s Drop tears down the HDV device host → `Teardown` → drops the
+    // boxed `Ops` (and all its keepalives). So this is the sole owner.
+    pci: PciDevice,
 }
 
 impl VirtioHdvDevice {
-    /// Bind a virtio device of the given `device_id` onto an HDV device host.
-    /// `device_id` is the virtio PCI device id (0x1a == virtio-fs).
-    pub fn new(host: DeviceHost, _device_id: u16) -> Self {
-        // TODO(milestone-2): implement hdv::pci::PciOps over OpenVMM's
-        // VirtioPciDevice (GuestMemory ← apertures, doorbells, MSI, BAR intercepts).
-        Self { _host: host }
+    /// Attach a virtio-fs share of `workspace` (host directory) to the guest
+    /// behind `host`, advertised under `tag`. `guest_mem_size` is the guest RAM
+    /// size — the upper bound on GPAs the virtqueues may reference.
+    pub fn attach(
+        host: DeviceHost,
+        workspace: &Path,
+        tag: &str,
+        guest_mem_size: u64,
+    ) -> Result<Self, AttachError> {
+        // A background IOCP pool drives the device's async tasks (queue workers,
+        // deferred config reads) for its whole lifetime.
+        let (pool_thread, driver) = DefaultPool::spawn_on_thread("virtio-hdv");
+
+        // The HDV device handle is bound after create; the memory + MSI seams
+        // read it from this shared cell.
+        let handle = DeviceHandle::new();
+        let guest_memory = HdvGuestMemory::into_guest_memory(handle.clone(), guest_mem_size);
+
+        let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+        msi_conn.connect(Arc::new(HdvSignalMsi::new(handle.clone())));
+
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+
+        let fs = VirtioFs::new(workspace, None).map_err(|e| AttachError::Fs(e.to_string()))?;
+        // shmem_size = 0: no DAX window, hence no BAR4 / shared_mem_mapper.
+        let fs_device = VirtioFsDevice::new(&driver_source, tag, fs, 0, None);
+
+        let pci_dev = VirtioPciDevice::new(
+            Box::new(fs_device),
+            &driver,
+            guest_memory,
+            PciInterruptModel::Msix(msi_conn.target()),
+            None,                                 // no doorbell: notify via BAR0 MMIO intercept
+            &mut ExternallyManagedMmioIntercepts, // HDV owns BAR placement; we route by (bar,offset)
+            None,                                 // no shared-memory mapper (shmem_size == 0)
+        )
+        .map_err(AttachError::Transport)?;
+
+        let dev = Arc::new(Mutex::new(pci_dev));
+
+        // Pump the device's poll function: each `poll_device` call re-arms its
+        // waker, so this future re-runs whenever the device has async work —
+        // advancing the queue state machine and replaying stalled MMIO (which
+        // completes the deferred reads our `read_bar` blocks on). It holds the
+        // device lock only across each poll, never while parked.
+        let poll_dev = dev.clone();
+        let poll_task = driver.spawn("virtio-hdv-poll", async move {
+            std::future::poll_fn(|cx| {
+                poll_dev.lock().unwrap().poll_device(cx);
+                Poll::<()>::Pending
+            })
+            .await
+        });
+
+        let ops = Ops {
+            dev,
+            _pool_thread: pool_thread,
+            _driver: driver,
+            _msi_conn: msi_conn,
+            _driver_source: driver_source,
+            _poll_task: poll_task,
+        };
+
+        let pci = PciDevice::create(host, Box::new(ops)).map_err(AttachError::Hdv)?;
+        // Now the guest-memory + MSI seams can reach the device.
+        handle.set(pci.device());
+
+        Ok(Self { pci })
     }
+
+    /// The underlying HDV device handle.
+    pub fn device(&self) -> hdv::Device {
+        self.pci.device()
+    }
+}
+
+/// The [`PciOps`] HDV drives, bridging its PCI vtable to OpenVMM's
+/// [`VirtioPciDevice`]. Also the home of every object that must live as long as
+/// the device (HDV owns this box until `Teardown`).
+struct Ops {
+    dev: Arc<Mutex<VirtioPciDevice>>,
+    // Keepalives — dropped together when HDV tears the device down.
+    _pool_thread: JoinHandle<()>,
+    _driver: DefaultDriver,
+    _msi_conn: MsiConnection,
+    _driver_source: VmTaskDriverSource,
+    _poll_task: Task<()>,
+}
+
+impl PciOps for Ops {
+    fn details(&self) -> PciDetails {
+        let mut dev = self.dev.lock().unwrap();
+        let id = cfg_read(&mut dev, 0x00); // device<<16 | vendor
+        let class = cfg_read(&mut dev, 0x08); // class(24) | revision
+        let sub = cfg_read(&mut dev, 0x2c); // subsystem<<16 | subvendor
+
+        // Standard PCI BAR sizing: write all-ones, read back the size mask,
+        // restore. HDV uses these to allocate the BARs' guest address space.
+        let mut probed = [0u32; 6];
+        for (i, slot) in probed.iter_mut().enumerate() {
+            let off = 0x10 + (i as u16) * 4;
+            let orig = cfg_read(&mut dev, off);
+            cfg_write(&mut dev, off, 0xFFFF_FFFF);
+            *slot = cfg_read(&mut dev, off);
+            cfg_write(&mut dev, off, orig);
+        }
+
+        PciDetails {
+            vendor_id: id as u16,
+            device_id: (id >> 16) as u16,
+            revision_id: class as u8,
+            prog_if: (class >> 8) as u8,
+            sub_class: (class >> 16) as u8,
+            base_class: (class >> 24) as u8,
+            sub_vendor_id: sub as u16,
+            sub_system_id: (sub >> 16) as u16,
+            probed_bars: probed,
+        }
+    }
+
+    fn read_config(&self, offset: u32) -> u32 {
+        cfg_read(&mut self.dev.lock().unwrap(), offset as u16)
+    }
+
+    fn write_config(&self, offset: u32, value: u32) {
+        cfg_write(&mut self.dev.lock().unwrap(), offset as u16, value);
+    }
+
+    fn read_bar(&self, bar: u8, offset: u64, data: &mut [u8]) {
+        let mut dev = self.dev.lock().unwrap();
+        let Some(base) = bar_base(&mut dev, bar) else {
+            data.fill(0xff);
+            return;
+        };
+        match dev.mmio_read(base + offset, data) {
+            IoResult::Ok => {}
+            IoResult::Err(_) => data.fill(0xff),
+            IoResult::Defer(token) => {
+                // Release the lock so the poll pump can complete this read.
+                drop(dev);
+                if block_on(token.read_future(data)).is_err() {
+                    data.fill(0xff);
+                }
+            }
+        }
+    }
+
+    fn write_bar(&self, bar: u8, offset: u64, data: &[u8]) {
+        let mut dev = self.dev.lock().unwrap();
+        let Some(base) = bar_base(&mut dev, bar) else {
+            return;
+        };
+        match dev.mmio_write(base + offset, data) {
+            IoResult::Ok | IoResult::Err(_) => {}
+            IoResult::Defer(token) => {
+                drop(dev);
+                let _ = block_on(token.write_future());
+            }
+        }
+    }
+
+    fn start(&self) -> bool {
+        true
+    }
+}
+
+/// Read one config dword (treat a deferred/failed read as 0, the PCI convention).
+fn cfg_read(dev: &mut VirtioPciDevice, off: u16) -> u32 {
+    let mut v = 0u32;
+    if let IoResult::Ok = dev.pci_cfg_read(off, &mut v) {
+        v
+    } else {
+        0
+    }
+}
+
+/// Write one config dword (ignore deferral/failure — config writes are sync here).
+fn cfg_write(dev: &mut VirtioPciDevice, off: u16, val: u32) {
+    let _ = dev.pci_cfg_write(off, val);
+}
+
+/// The guest-programmed base GPA of `bar` (an HDV BAR selector index), read back
+/// from the device's config space. virtio BARs are 64-bit memory BARs, so the
+/// base spans two config dwords. `None` if the BAR is unprogrammed.
+fn bar_base(dev: &mut VirtioPciDevice, bar: u8) -> Option<u64> {
+    let off = 0x10 + (bar as u16) * 4;
+    let lo = cfg_read(dev, off) & 0xFFFF_FFF0;
+    let hi = cfg_read(dev, off + 4);
+    let base = ((hi as u64) << 32) | lo as u64;
+    (base != 0).then_some(base)
 }
