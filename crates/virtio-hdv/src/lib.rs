@@ -137,13 +137,56 @@ impl Drop for RearmNet {
 
 impl VirtioHdvDevice {
     /// Attach a virtio-fs share of `workspace` (host directory) to the guest
-    /// behind `host`, advertised under `tag`. `guest_mem_size` is the guest RAM
-    /// size — the upper bound on GPAs the virtqueues may reference.
+    /// behind `host`, advertised under `tag`, with the well-known device instance
+    /// id. `guest_mem_size` is the guest RAM size — the upper bound on GPAs the
+    /// virtqueues may reference.
     pub fn attach(
         host: DeviceHost,
         workspace: &Path,
         tag: &str,
         guest_mem_size: u64,
+    ) -> Result<Self, AttachError> {
+        Self::attach_with_instance(
+            host,
+            workspace,
+            tag,
+            guest_mem_size,
+            &hdv::pci::HVFS_DEVICE_INSTANCE_ID,
+        )
+    }
+
+    /// Like [`attach`](Self::attach) but with a caller-chosen `DeviceInstanceId`,
+    /// on its own (owned) device host.
+    pub fn attach_with_instance(
+        host: DeviceHost,
+        workspace: &Path,
+        tag: &str,
+        guest_mem_size: u64,
+        instance_id: &hdv::GUID,
+    ) -> Result<Self, AttachError> {
+        Self::attach_shared(
+            Arc::new(host),
+            workspace,
+            tag,
+            guest_mem_size,
+            &hdv::pci::HVFS_DEVICE_CLASS_ID,
+            instance_id,
+        )
+    }
+
+    /// Attach a virtio-fs device on a **shared** device host, so several shares can
+    /// coexist in one guest (HDV permits only one device host per VM — see the
+    /// hotplug spike). Each concurrent device needs a **distinct `class_id` +
+    /// `instance_id`** and a matching `FlexibleIov` slot (a second slot reusing an
+    /// `EmulatorId` is rejected with `ERROR_HV_INVALID_PARAMETER`). The caller keeps
+    /// the `Arc<DeviceHost>` and passes a clone per device.
+    pub fn attach_shared(
+        host: Arc<DeviceHost>,
+        workspace: &Path,
+        tag: &str,
+        guest_mem_size: u64,
+        class_id: &hdv::GUID,
+        instance_id: &hdv::GUID,
     ) -> Result<Self, AttachError> {
         // A background IOCP pool drives the device's async tasks (queue workers,
         // deferred config reads) for its whole lifetime.
@@ -211,7 +254,8 @@ impl VirtioHdvDevice {
             _poll_task: poll_task,
         };
 
-        let pci = PciDevice::create(host, Box::new(ops)).map_err(AttachError::Hdv)?;
+        let pci = PciDevice::create_shared(host, Box::new(ops), class_id, instance_id)
+            .map_err(AttachError::Hdv)?;
         // Now the guest-memory + MSI seams can reach the device.
         handle.set(pci.device());
 

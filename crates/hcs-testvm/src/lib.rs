@@ -104,8 +104,9 @@ pub struct RockyConfig {
     pub kernel_cmdline: String,
     pub memory_mb: u32,
     pub processor_count: u32,
-    /// Optional HDV device slot to declare in the compute-system document.
-    pub flexible_iov: Option<FlexibleIovSlot>,
+    /// HDV device slots to declare in the compute-system document (cold). Multiple
+    /// entries declare multiple `FlexibleIov` devices at create time.
+    pub flexible_iovs: Vec<FlexibleIovSlot>,
 }
 
 impl RockyConfig {
@@ -118,14 +119,15 @@ impl RockyConfig {
             kernel_cmdline: "console=ttyS0".into(),
             memory_mb: 4096,
             processor_count: 2,
-            flexible_iov: None,
+            flexible_iovs: Vec::new(),
         }
     }
 
     /// Declare a `FlexibleIov` device slot (so an HDV device gets a VPCI bus to
-    /// appear on). See [`FlexibleIovSlot`].
+    /// appear on). Call more than once to declare several devices cold. See
+    /// [`FlexibleIovSlot`].
     pub fn with_flexible_iov(mut self, slot: FlexibleIovSlot) -> Self {
-        self.flexible_iov = Some(slot);
+        self.flexible_iovs.push(slot);
         self
     }
 }
@@ -152,22 +154,29 @@ fn build_document(cfg: &RockyConfig, console_pipe: &str) -> String {
     let mut devices = serde_json::json!({
         "ComPorts": { "0": { "NamedPipe": console_pipe } }
     });
-    if let Some(slot) = &cfg.flexible_iov {
+    if !cfg.flexible_iovs.is_empty() {
         // Devices.FlexibleIov is a map keyed by the device instance GUID.
         let mut map = serde_json::Map::new();
-        map.insert(
-            slot.instance_guid.clone(),
-            serde_json::json!({
-                "EmulatorId": slot.emulator_id,
-                "HostingModel": slot.hosting_model,
-            }),
-        );
+        for slot in &cfg.flexible_iovs {
+            map.insert(
+                slot.instance_guid.clone(),
+                serde_json::json!({
+                    "EmulatorId": slot.emulator_id,
+                    "HostingModel": slot.hosting_model,
+                }),
+            );
+        }
         devices["FlexibleIov"] = serde_json::Value::Object(map);
     }
 
     serde_json::json!({
         "Owner": "hyperv-virtiofs-test",
-        "SchemaVersion": { "Major": 2, "Minor": 1 },
+        // Windows 11 schema version, matching WSL (it uses {2,7} on Win11, {2,3} on
+        // Win10 — `HcsVirtualMachine.cpp` `IsWindows11OrAbove`). Create/boot/FlexibleIov
+        // Add all work at {2,7}. (It does not unlock FlexibleIov *Remove* — still
+        // ERROR_NOT_SUPPORTED — so the schema version is not the removal gate; but {2,7}
+        // is the correct, future-proof value for a Win11 host.)
+        "SchemaVersion": { "Major": 2, "Minor": 7 },
         "ShouldTerminateOnLastHandleClosed": true,
         "VirtualMachine": {
             "Chipset": {

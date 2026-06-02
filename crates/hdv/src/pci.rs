@@ -18,6 +18,7 @@ use crate::{Device, DeviceHost, Error, Result};
 use hdv_sys as sys;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 /// `E_FAIL` — returned from a callback whose Rust body panicked, so a panic never
 /// unwinds across the FFI boundary into HDV.
@@ -320,20 +321,56 @@ unsafe fn wide_to_vec(p: sys::LPCWSTR) -> Vec<u16> {
     unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
 }
 
-/// A PCI device attached to a guest over HDV. Owns the [`DeviceHost`]; dropping it
-/// tears the device down (which frees the behaviour via the `Teardown` callback).
+/// A PCI device attached to a guest over HDV. Holds a (possibly shared) reference
+/// to the [`DeviceHost`]. Because HDV allows only **one device host per VM** (the
+/// hotplug spike found a second `from_proxy` is rejected), multiple devices share
+/// one host via `Arc`; the host — and with it every device still on it — is torn
+/// down when the last `Arc` ref drops (`HdvTeardownDeviceHost`).
 pub struct PciDevice {
-    // Field order matters: `host` is the sole owner whose Drop triggers HDV
-    // teardown. The behaviour `Context` is owned by HDV and reclaimed in the
-    // `Teardown` trampoline, so it is not held here.
-    host: DeviceHost,
+    // The behaviour `Context` is owned by HDV and reclaimed in the `Teardown`
+    // trampoline, so it is not held here. Per-device removal (without dropping the
+    // host) is driven host-side by removing the device's FlexibleIov slot.
+    host: Arc<DeviceHost>,
     device: Device,
 }
 
 impl PciDevice {
-    /// Create a PCI device instance on `host`, driven by `ops`. Non-blocking; HDV
-    /// then calls `ops` on its own threads as the guest touches the device.
+    /// Create a PCI device instance on `host`, driven by `ops`, with the
+    /// well-known [`HVFS_DEVICE_INSTANCE_ID`]. Non-blocking; HDV then calls `ops`
+    /// on its own threads as the guest touches the device.
     pub fn create(host: DeviceHost, ops: Box<dyn PciOps>) -> Result<Self> {
+        Self::create_with_instance(host, ops, &HVFS_DEVICE_INSTANCE_ID)
+    }
+
+    /// Like [`create`](Self::create) but with a caller-chosen `DeviceInstanceId`,
+    /// so more than one such device can coexist in a guest — each needs a distinct
+    /// instance id and a matching `FlexibleIov` slot (map-key == this id). The
+    /// class id stays [`HVFS_DEVICE_CLASS_ID`].
+    // TODO(caller-guids): the class id (and the device-host id, in `proxy`) are
+    // still fixed constants; full override is the tracked README follow-up. The
+    // device-hotplug spike uses this to stand up two devices at once.
+    pub fn create_with_instance(
+        host: DeviceHost,
+        ops: Box<dyn PciOps>,
+        instance_id: &sys::GUID,
+    ) -> Result<Self> {
+        Self::create_shared(Arc::new(host), ops, &HVFS_DEVICE_CLASS_ID, instance_id)
+    }
+
+    /// Like [`create_with_instance`](Self::create_with_instance) but on a **shared**
+    /// device host and with a caller-chosen `class_id` (`DeviceClassId`/`EmulatorId`),
+    /// so several devices can live on the one host HDV permits per VM (the hotplug
+    /// spike's multi-share model). Each concurrent device needs a **distinct
+    /// `class_id`** — the VID rejects a second `FlexibleIov` slot that reuses an
+    /// `EmulatorId` with `ERROR_HV_INVALID_PARAMETER` (WSL likewise gives each of its
+    /// virtiofs/net/pmem emulators its own class GUID). The caller keeps the `Arc`
+    /// and hands a clone per device; the host is torn down when the last clone drops.
+    pub fn create_shared(
+        host: Arc<DeviceHost>,
+        ops: Box<dyn PciOps>,
+        class_id: &sys::GUID,
+        instance_id: &sys::GUID,
+    ) -> Result<Self> {
         let ctx = Box::into_raw(Context::new(ops));
         let mut device: sys::HDV_DEVICE = std::ptr::null_mut();
         // SAFETY: `host.raw()` is a live device host; `ctx` points at a live
@@ -344,8 +381,8 @@ impl PciDevice {
             sys::HdvCreateDeviceInstance(
                 host.raw(),
                 sys::HDV_DEVICE_TYPE::Pci,
-                &HVFS_DEVICE_CLASS_ID,
-                &HVFS_DEVICE_INSTANCE_ID,
+                class_id,
+                instance_id,
                 &(*ctx).vtable as *const sys::HDV_PCI_DEVICE_INTERFACE as *const c_void,
                 ctx as sys::PVOID,
                 &mut device,
@@ -368,8 +405,14 @@ impl PciDevice {
         self.device
     }
 
-    /// The owning device host.
+    /// The (shared) device host this device lives on.
     pub fn host(&self) -> &DeviceHost {
         &self.host
+    }
+
+    /// A new reference to the shared device host — for creating sibling devices on
+    /// the same host (only one host per VM is permitted).
+    pub fn host_arc(&self) -> Arc<DeviceHost> {
+        self.host.clone()
     }
 }

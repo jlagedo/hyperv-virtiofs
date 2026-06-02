@@ -15,6 +15,11 @@ use std::ffi::c_void;
 pub mod pci;
 pub mod proxy;
 
+/// Re-export the raw GUID type so consumers can name device class/instance/host
+/// ids (e.g. to derive distinct per-device instance ids) without depending on
+/// `hdv-sys` directly.
+pub use sys::GUID;
+
 /// An HDV call failed. Carries the raw `HRESULT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub sys::HRESULT);
