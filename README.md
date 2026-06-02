@@ -39,6 +39,60 @@ project puts a real virtio-fs device on that escape hatch — empirically, a sto
 EL10 kernel mounts an OpenVMM virtio-fs share read-write under WHP (proof in the
 design notes).
 
+## How it works
+
+The DLL stands up a **virtio-fs device** on the HDV escape hatch and runs the FUSE
+server for it in-process, so a host directory surfaces as a normal mount inside the
+guest. The crate stack (top → bottom) maps onto the platform like this:
+
+```mermaid
+flowchart TB
+    dir[("Host directory<br/>C:\share")]
+
+    subgraph host["Windows host · user mode"]
+        consumer["Consumer process<br/>(loads the DLL by absolute path)"]
+        subgraph dll["hyperv_virtiofs.dll · this project"]
+            direction TB
+            abi["C ABI<br/>hvfs_host_open · hvfs_add_share"]
+            vfs["hyperv_virtiofs cdylib<br/>+ OpenVMM virtiofs<br/>(VirtioFsDevice · FUSE backend)"]
+            tr["virtio-hdv<br/>VirtioPciDevice over HDV (PciOps)"]
+            hdv["hdv / hdv-sys<br/>RAII + FFI to vmdevicehost.dll"]
+        end
+    end
+
+    subgraph plat["Windows virtualization platform"]
+        hcs["HCS / vmcompute"]
+        vid["Hyper-V VMBus + VID<br/>(owns guest-facing BAR placement)"]
+    end
+
+    subgraph guest["Linux guest · e.g. Rocky EL10"]
+        vpci["VMBus VPCI bus"]
+        drv["virtio-fs driver (virtiofs.ko)"]
+        mnt["mount -t virtiofs &lt;tag&gt; /mnt"]
+    end
+
+    consumer --> abi
+    abi --> vfs --> tr --> hdv
+    dir -.->|"served by FUSE backend"| vfs
+
+    %% control path — bring the device up
+    abi -->|"HcsModifyComputeSystem (Add)"| hcs
+    hdv -->|"RegisterDeviceHost<br/>(FlexibleIov proxy)"| hcs
+    hcs --> vid -->|"device enumerates"| vpci --> drv --> mnt
+
+    %% data path — runtime I/O
+    tr <-->|"virtqueues ⇄ guest-memory apertures<br/>MSI-X interrupts · doorbell kicks"| vid
+```
+
+- **Control path (setup, solid arrows):** the consumer registers one HDV device host
+  against its compute system (`hvfs_host_open`) and hot-adds a virtio-fs device per share
+  (`hvfs_add_share` → `HcsModifyComputeSystem` Add). The Hyper-V VID surfaces the device on
+  the guest's VPCI bus, where `virtiofs.ko` binds it and the guest mounts the `tag`.
+- **Data path (runtime, double arrow):** the guest driver and our in-process
+  `VirtioFsDevice` exchange FUSE requests over virtqueues. `virtio-hdv` backs those seams
+  with HDV — guest memory via apertures, kicks via doorbells, completions via MSI-X — and
+  the FUSE backend services each request against the host directory.
+
 ## Design: agnostic by construction
 
 The product's entire contract is the C ABI in
@@ -105,20 +159,6 @@ and **`hyper-v\…`** = Microsoft's internal Windows depot (not mirrored): an `h
 `cdylib` wiring) plus a `wsldevicehost` COM/DLL shim we don't need. So `virtio-hdv` is the
 open re-implementation of one internal file (`virtio_hdv.rs`) over otherwise-public crates.
 
-## Bindings — there are none here, on purpose
-
-This repo ships the **DLL + import lib + the C header**. Language bindings live with
-each **consumer**, not here, because the agnostic contract is the C ABI. Go consumers
-bind it with `syscall.NewLazyDLL` + `NewProc` — **no cgo** — exactly as Windows hosts
-bind `computecore.dll`; the surface is five calls, so a maintained cgo module would
-be pure overhead. [`examples/`](examples) holds an **authoritative C** reference and
-an **illustrative Go** snippet (not a published module — copy the pattern, don't
-import it).
-
-Load by **absolute path**, never a bare name: consumers are typically elevated
-services, and a bare name invites DLL-preloading. See
-[Go's Windows DLL guidance](https://go.dev/wiki/WindowsDLLs).
-
 ## Build
 
 Prerequisites: a Rust 1.95+ toolchain and **`protoc`** (the reused OpenVMM crates
@@ -142,38 +182,9 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
 
 ## Roadmap
 
-**Shipped** below; **all open work** (live removal, `ro` enforcement, caller-supplied GUIDs,
-logger wiring, coherent guest memory) lives in one place — [`docs/roadmap.md`](docs/roadmap.md).
-
-- [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and
-  compiling on Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`,
-  `lx`/`lxutil` FUSE backend). The foundational feasibility question is answered.
-- [x] **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
-  `HdvCreateDeviceInstance`, guest-memory apertures, doorbells, the proxy ABI) and
-  safe wrappers.
-- [x] **HDV attach handshake** *(the linchpin)* — the `ExternalRestricted` FlexibleIov
-  proxy path works in-process: `HdvInitializeDeviceHostForProxy` →
-  `IVmDeviceHostSupport::RegisterDeviceHost` → `HdvProxyDeviceHost`, then the guest
-  enumerates the device over VMBus VPCI (`docs/hdv-proxy-abi.md`).
-- [x] **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: implements
-  `hdv::pci::PciOps` over OpenVMM's public `VirtioPciDevice`, backing its seams with
-  HDV — `GuestMemory` ← apertures (`HdvCreateGuestMemoryAperture`),
-  `PciInterruptModel::Msix` ← `HdvDeliverGuestInterrupt`, PCI config + BAR MMIO ←
-  HDV's device-vtable callbacks (routed `(bar, offset)` → `find_bar` via internal
-  BAR bases, since the VMBus VID owns guest-facing BAR placement). Drives the reused
-  `VirtioFsDevice`; the guest mounts and does file I/O. (`shmem_size = 0` → no DAX
-  BAR yet.)
-- [x] **Wire the C ABI (host/share, v2)** — the cdylib opens the compute system
-  (`HcsOpenComputeSystem`), proxy-registers one HDV device host (`hvfs_host_open`),
-  and **hot-adds a virtio-fs device per share at runtime** (`hvfs_add_share` →
-  `HcsModifyComputeSystem` Add); a guest hot-mounts each share through the shipped ABI
-  (`hcs-testvm/tests/attach_abi.rs`). Multiple shares coexist on one VM via the
-  well-known virtio-fs class id + a caller-supplied unique instance id. Full design:
-  [`docs/share-abi.md`](docs/share-abi.md).
-
-**Open work** — live share removal (platform-blocked), Windows support-matrix re-test, `ro`
-enforcement, caller-supplied class/host GUIDs, `hvfs_set_logger` wiring, and coherent guest
-memory — is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+What's **shipped** and what's still **open** — live share removal (platform-blocked), `ro`
+enforcement, caller-supplied GUIDs, logger wiring, and coherent guest memory — is tracked in
+one place: [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Contributing & security
 

@@ -1,14 +1,13 @@
-# Roadmap — open development work
+# Roadmap
 
-**The single source of truth for everything left to spike, confirm, or develop.** If a
-capability is unfinished, blocked, or unverified, it is tracked here — not scattered across the
-README, the spike notes, or code TODOs. Those carry at most a one-line pointer back to this file.
+**The single source of truth for status** — what's already **shipped** (bottom) and
+everything left to spike, confirm, or develop. If a capability is unfinished, blocked, or
+unverified, it is tracked here — not scattered across the README, the spike notes, or code
+TODOs. Those carry at most a one-line pointer back to this file. Design and record detail for
+shipped work lives in the design docs ([`share-abi.md`](share-abi.md),
+[`hotplug-spike.md`](hotplug-spike.md), [`hdv-proxy-abi.md`](hdv-proxy-abi.md)).
 
-What's already **shipped and verified** is recorded in [`README.md`](../README.md) (the `[x]` list)
-and the design/record docs ([`share-abi.md`](share-abi.md), [`hotplug-spike.md`](hotplug-spike.md),
-[`hdv-proxy-abi.md`](hdv-proxy-abi.md)); this file is only the *open* surface.
-
-Each item is tagged by the kind of work remaining:
+Each open item is tagged by the kind of work remaining:
 - **develop** — the path is understood; it needs building.
 - **confirm** — built or believed, but unverified on a wider matrix; needs a measurement.
 - **blocked** — the platform refuses it today; tracked so we revisit when that changes.
@@ -80,3 +79,34 @@ The proof masks HDV aperture-cache staleness with a persistent mapping + interru
 **eviction protocol** (à la WSL's `HdvGuestMemoryEvictionWorker`), replacing the mitigation.
 
 - Refs: `virtio-hdv` guest-memory aperture path; spike's aperture-staleness notes.
+
+---
+
+## shipped
+
+The verified record of what works. Each item is proven by tests and/or the design docs.
+
+- [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and compiling on
+  Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`, `lx`/`lxutil` FUSE backend).
+  The foundational feasibility question is answered.
+- [x] **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
+  `HdvCreateDeviceInstance`, guest-memory apertures, doorbells, the proxy ABI) and safe
+  wrappers.
+- [x] **HDV attach handshake** *(the linchpin)* — the `ExternalRestricted` FlexibleIov proxy
+  path works in-process: `HdvInitializeDeviceHostForProxy` →
+  `IVmDeviceHostSupport::RegisterDeviceHost` → `HdvProxyDeviceHost`, then the guest enumerates
+  the device over VMBus VPCI ([`hdv-proxy-abi.md`](hdv-proxy-abi.md)).
+- [x] **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: implements
+  `hdv::pci::PciOps` over OpenVMM's public `VirtioPciDevice`, backing its seams with HDV —
+  `GuestMemory` ← apertures (`HdvCreateGuestMemoryAperture`), `PciInterruptModel::Msix` ←
+  `HdvDeliverGuestInterrupt`, PCI config + BAR MMIO ← HDV's device-vtable callbacks (routed
+  `(bar, offset)` → `find_bar` via internal BAR bases, since the VMBus VID owns guest-facing
+  BAR placement). Drives the reused `VirtioFsDevice`; the guest mounts and does file I/O.
+  (`shmem_size = 0` → no DAX BAR yet.)
+- [x] **Wire the C ABI (host/share, v2)** — the cdylib opens the compute system
+  (`HcsOpenComputeSystem`), proxy-registers one HDV device host (`hvfs_host_open`), and
+  **hot-adds a virtio-fs device per share at runtime** (`hvfs_add_share` →
+  `HcsModifyComputeSystem` Add); a guest hot-mounts each share through the shipped ABI
+  (`hcs-testvm/tests/attach_abi.rs`). Multiple shares coexist on one VM via the well-known
+  virtio-fs class id + a caller-supplied unique instance id. Full design:
+  [`share-abi.md`](share-abi.md).
