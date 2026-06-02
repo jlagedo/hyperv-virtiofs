@@ -27,7 +27,12 @@ impl SignalMsi for HdvSignalMsi {
         if let Some(device) = self.handle.get() {
             // A failed injection is logged-and-dropped: there is no caller to
             // propagate to (this is a fire-and-forget notification path).
-            let _ = device.deliver_interrupt(address, data);
+            let r = device.deliver_interrupt(address, data);
+            crate::trace::trace!("deliver_interrupt addr={address:#x} data={data:#x} -> {r:?}");
+        } else {
+            crate::trace::trace!(
+                "deliver_interrupt addr={address:#x} data={data:#x} DROPPED (no handle)"
+            );
         }
     }
 }

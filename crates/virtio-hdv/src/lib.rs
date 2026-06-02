@@ -7,7 +7,7 @@
 //! 1. Build OpenVMM's public [`VirtioPciDevice`] fronting a [`VirtioFsDevice`]
 //!    (which fronts a host directory via [`VirtioFs`]).
 //! 2. Back its three host seams with HDV:
-//!    - guest memory ← `HdvReadGuestMemory`/`HdvWriteGuestMemory` ([`mem`]),
+//!    - guest memory (DMA) ← `HdvCreateGuestMemoryAperture` ([`mem`]),
 //!    - MSI-X delivery ← `HdvDeliverGuestInterrupt` ([`interrupt`]),
 //!    - the PCI config space + BAR MMIO ← HDV's device-vtable callbacks, via the
 //!      generic [`hdv::pci::PciOps`] this crate implements below.
@@ -17,13 +17,14 @@
 //! **Scope (milestone 2, first proof):** no DAX — `shmem_size = 0`, so there is
 //! no shared-memory BAR and no `shared_mem_mapper` / `HdvCreateSectionBackedMmioRange`
 //! on the critical path. Notify rides the BAR0 MMIO intercept (no doorbell yet).
-//! Guest memory is copy-per-access; a zero-copy aperture backing is the perf
-//! follow-up. Both are deliberate simplifications, documented inline.
+//! Both are deliberate simplifications, documented inline.
 //!
 //! [`VirtioPciDevice`]: virtio::VirtioPciDevice
 //! [`VirtioFsDevice`]: virtiofs::virtio::VirtioFsDevice
 //! [`VirtioFs`]: virtiofs::VirtioFs
 
+#[macro_use]
+mod trace;
 mod handle;
 mod interrupt;
 mod mem;
@@ -38,7 +39,7 @@ use futures::executor::block_on;
 use hdv::pci::{PciDetails, PciDevice, PciOps};
 use hdv::DeviceHost;
 use interrupt::HdvSignalMsi;
-use mem::HdvGuestMemory;
+use mem::HdvApertureMem;
 use pal_async::task::{Spawn, Task};
 use pal_async::{DefaultDriver, DefaultPool};
 use pci_core::bus_range::AssignedBusRange;
@@ -47,6 +48,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::thread::JoinHandle;
+use trace::trace;
 use virtio::{PciInterruptModel, VirtioPciDevice};
 use virtiofs::virtio::VirtioFsDevice;
 use virtiofs::VirtioFs;
@@ -100,7 +102,7 @@ impl VirtioHdvDevice {
         // The HDV device handle is bound after create; the memory + MSI seams
         // read it from this shared cell.
         let handle = DeviceHandle::new();
-        let guest_memory = HdvGuestMemory::into_guest_memory(handle.clone(), guest_mem_size);
+        let guest_memory = HdvApertureMem::into_guest_memory(handle.clone(), guest_mem_size);
 
         let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
         msi_conn.connect(Arc::new(HdvSignalMsi::new(handle.clone())));
@@ -111,7 +113,7 @@ impl VirtioHdvDevice {
         // shmem_size = 0: no DAX window, hence no BAR4 / shared_mem_mapper.
         let fs_device = VirtioFsDevice::new(&driver_source, tag, fs, 0, None);
 
-        let pci_dev = VirtioPciDevice::new(
+        let mut pci_dev = VirtioPciDevice::new(
             Box::new(fs_device),
             &driver,
             guest_memory,
@@ -121,6 +123,17 @@ impl VirtioHdvDevice {
             None,                                 // no shared-memory mapper (shmem_size == 0)
         )
         .map_err(AttachError::Transport)?;
+
+        // HDV (the VMBus VPCI VID) owns guest-facing BAR placement: it sizes BARs
+        // from `GetDetails`, assigns them out-of-band over VMBus, and delivers MMIO
+        // pre-decoded as `(bar, offset)`. The guest never reads or writes our config
+        // BAR registers (confirmed on the rig) — so they're invisible to it. We give
+        // the emulator its own internal BAR bases purely so `find_bar` can resolve
+        // the address we rebuild from HDV's `(bar, offset)`. We do NOT touch the
+        // command register — the guest enables memory space itself, which fires
+        // `update_mmio_enabled` against these bases. (Pre-enabling bus master here
+        // makes the VID reject the device before enumeration.)
+        program_internal_bars(&mut pci_dev);
 
         let dev = Arc::new(Mutex::new(pci_dev));
 
@@ -205,28 +218,45 @@ impl PciOps for Ops {
     }
 
     fn read_config(&self, offset: u32) -> u32 {
-        cfg_read(&mut self.dev.lock().unwrap(), offset as u16)
+        let v = cfg_read(&mut self.dev.lock().unwrap(), offset as u16);
+        trace!("read_config off={offset:#x} -> {v:#010x}");
+        v
     }
 
     fn write_config(&self, offset: u32, value: u32) {
+        trace!("write_config off={offset:#x} val={value:#010x}");
         cfg_write(&mut self.dev.lock().unwrap(), offset as u16, value);
     }
 
     fn read_bar(&self, bar: u8, offset: u64, data: &mut [u8]) {
         let mut dev = self.dev.lock().unwrap();
         let Some(base) = bar_base(&mut dev, bar) else {
+            trace!(
+                "read_bar bar={bar} off={offset:#x} len={} -> NO BAR BASE",
+                data.len()
+            );
             data.fill(0xff);
             return;
         };
+        trace!(
+            "read_bar bar={bar} off={offset:#x} len={} addr={:#x}",
+            data.len(),
+            base + offset
+        );
         match dev.mmio_read(base + offset, data) {
-            IoResult::Ok => {}
-            IoResult::Err(_) => data.fill(0xff),
+            IoResult::Ok => trace!("  -> ok {data:02x?}"),
+            IoResult::Err(e) => {
+                trace!("  -> err {e:?}");
+                data.fill(0xff);
+            }
             IoResult::Defer(token) => {
                 // Release the lock so the poll pump can complete this read.
                 drop(dev);
+                trace!("  -> defer, blocking…");
                 if block_on(token.read_future(data)).is_err() {
                     data.fill(0xff);
                 }
+                trace!("  -> defer done {data:02x?}");
             }
         }
     }
@@ -234,13 +264,20 @@ impl PciOps for Ops {
     fn write_bar(&self, bar: u8, offset: u64, data: &[u8]) {
         let mut dev = self.dev.lock().unwrap();
         let Some(base) = bar_base(&mut dev, bar) else {
+            trace!("write_bar bar={bar} off={offset:#x} -> NO BAR BASE");
             return;
         };
+        trace!(
+            "write_bar bar={bar} off={offset:#x} addr={:#x} {data:02x?}",
+            base + offset
+        );
         match dev.mmio_write(base + offset, data) {
             IoResult::Ok | IoResult::Err(_) => {}
             IoResult::Defer(token) => {
                 drop(dev);
+                trace!("  -> defer, blocking…");
                 let _ = block_on(token.write_future());
+                trace!("  -> defer done");
             }
         }
     }
@@ -265,13 +302,32 @@ fn cfg_write(dev: &mut VirtioPciDevice, off: u16, val: u32) {
     let _ = dev.pci_cfg_write(off, val);
 }
 
-/// The guest-programmed base GPA of `bar` (an HDV BAR selector index), read back
-/// from the device's config space. virtio BARs are 64-bit memory BARs, so the
-/// base spans two config dwords. `None` if the BAR is unprogrammed.
-fn bar_base(dev: &mut VirtioPciDevice, bar: u8) -> Option<u64> {
-    let off = 0x10 + (bar as u16) * 4;
-    let lo = cfg_read(dev, off) & 0xFFFF_FFF0;
-    let hi = cfg_read(dev, off + 4);
-    let base = ((hi as u64) << 32) | lo as u64;
-    (base != 0).then_some(base)
+/// Synthetic, internal BAR bases programmed into the config emulator so that
+/// `find_bar` can resolve HDV's pre-decoded `(bar, offset)` deliveries. These are
+/// never exposed to the guest (HDV owns the guest-facing BARs); they only key the
+/// emulator's address→region routing. Page-aligned, non-overlapping, above 4 GiB
+/// to avoid colliding with anything the emulator inspects.
+/// Internal BAR bases for `find_bar` routing — never seen by the guest (the VID
+/// places the guest-facing BARs out-of-band). Page-aligned, non-overlapping.
+const BAR0_BASE: u64 = 0x1_0000_0000;
+const BAR2_BASE: u64 = 0x1_0000_1000;
+
+/// Program the internal BAR bases (BAR0/BAR2, 64-bit memory BARs → two dwords
+/// each) into the config emulator. Leaves the command register alone — the guest
+/// enables memory space, which is what activates `find_bar`. Run once, pre-live.
+fn program_internal_bars(dev: &mut VirtioPciDevice) {
+    cfg_write(dev, 0x10, BAR0_BASE as u32);
+    cfg_write(dev, 0x14, (BAR0_BASE >> 32) as u32);
+    cfg_write(dev, 0x18, BAR2_BASE as u32);
+    cfg_write(dev, 0x1c, (BAR2_BASE >> 32) as u32);
+}
+
+/// The internal base for an HDV BAR selector index (BAR0 = transport, BAR2 =
+/// MSI-X). `None` for BARs the device doesn't use.
+fn bar_base(_dev: &mut VirtioPciDevice, bar: u8) -> Option<u64> {
+    match bar {
+        0 => Some(BAR0_BASE),
+        2 => Some(BAR2_BASE),
+        _ => None,
+    }
 }
