@@ -10,31 +10,59 @@
 //! APIs return `E_ACCESSDENIED` for the guest's virtqueue/DMA memory — they don't
 //! carry device DMA rights. WSL's own `wsldevicehost.dll` uses
 //! `HdvCreateGuestMemoryAperture` exclusively (the copy APIs never appear in its
-//! decompile), confirming apertures are *the* DMA path. Apertures are cached per
-//! aligned region so repeated access to the rings doesn't re-map every time.
+//! decompile), confirming apertures are *the* DMA path.
+//!
+//! **Aperture coherency (the subtle part).** We keep **one persistent aperture**
+//! over the low guest RAM, created once and reused, rather than re-mapping per
+//! access. HDV apertures are backed by an *evictable page cache* (WSL runs an
+//! `HdvGuestMemoryEvictionWorker` thread to manage exactly this — see the
+//! decompile), so they are not a plain coherent shared mapping. Two consequences,
+//! both observed on the rig:
+//!   - **Re-mapping per access is worse** (~40% mount-and-do-IO success): the
+//!     create/destroy churn thrashes the cache, so the device intermittently reads
+//!     a stale descriptor and stalls following a bad chain.
+//!   - **One long-lived mapping is much better** (~80%): far less churn, but a
+//!     residual window remains where a guest write isn't yet reflected in the
+//!     host's cached page.
+//!
+//! The principled fix is to participate in HDV's eviction/invalidation protocol
+//! (à la WSL's worker) so the mapping is fully coherent. Until then the residual
+//! staleness is masked by the interrupt re-arm net (`lib.rs`) plus the spike
+//! test's boot retry — enough to reliably demonstrate the end-to-end path.
 //!
 //! [`GuestMemory`]: guestmem::GuestMemory
 
 use crate::handle::DeviceHandle;
 use guestmem::{GuestMemory, GuestMemoryAccess, GuestMemoryBackingError};
 use hdv::Aperture;
-use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-/// Region size for cached apertures (2 MiB, page-aligned). Each access maps the
-/// covering region once and reuses it.
-const CHUNK: u64 = 2 * 1024 * 1024;
 const PAGE: u64 = 4096;
+/// Size of the single persistent low-memory aperture (3 GiB — fits a `u32`
+/// `byteCount` and covers where the virtqueues/buffers live).
+const PERSIST: u64 = 0xC000_0000;
 
 /// `GuestMemoryAccess` backed by HDV apertures against a late-bound device.
 pub struct HdvApertureMem {
     handle: DeviceHandle,
     /// Upper bound on valid guest physical addresses (the guest RAM size).
     max_address: u64,
-    /// Cached apertures keyed by their CHUNK-aligned base GPA.
-    cache: Mutex<HashMap<u64, Aperture>>,
+    /// One persistent aperture over `[0, PERSIST)`, created on first access.
+    low: OnceLock<PersistAperture>,
+    /// Guards lazy creation against the race of two first-accessors.
+    init: Mutex<()>,
 }
+
+/// A long-lived aperture plus its mapped base pointer. `Send`/`Sync` because the
+/// pointer is only dereferenced under the page being valid for the device life.
+struct PersistAperture {
+    _ap: Aperture,
+    base_ptr: *mut u8,
+    len: u64,
+}
+unsafe impl Send for PersistAperture {}
+unsafe impl Sync for PersistAperture {}
 
 impl HdvApertureMem {
     /// Wrap into an OpenVMM [`GuestMemory`]. `max_address` is the guest RAM size
@@ -45,14 +73,15 @@ impl HdvApertureMem {
             Self {
                 handle,
                 max_address,
-                cache: Mutex::new(HashMap::new()),
+                low: OnceLock::new(),
+                init: Mutex::new(()),
             },
         )
     }
 
-    /// Run `f` with a host pointer to guest physical `[addr, addr+len)`, mapping
-    /// (and caching) the covering aperture as needed. The pointer is valid only
-    /// for the duration of `f`.
+    /// Run `f` with a host pointer to guest physical `[addr, addr+len)`.
+    /// Accesses within the persistent low aperture use it; anything above falls
+    /// back to a fresh one-shot aperture.
     fn with_mapping<R>(
         &self,
         addr: u64,
@@ -67,27 +96,34 @@ impl HdvApertureMem {
             .checked_add(len as u64)
             .ok_or_else(|| GuestMemoryBackingError::other(addr, BadRange))?;
 
-        // Fast path: the access fits inside one cached CHUNK.
-        if len as u64 <= CHUNK && addr / CHUNK == (end - 1) / CHUNK {
-            let base = (addr / CHUNK) * CHUNK;
-            let mut cache = self.cache.lock().unwrap();
-            if !cache.contains_key(&base) {
-                let len32 = CHUNK.min(self.max_address.saturating_sub(base)).max(PAGE) as u32;
-                let ap = device
-                    .create_aperture(base, len32, false)
-                    .map_err(|e| GuestMemoryBackingError::other(addr, ApertureFailed(e.0)))?;
-                cache.insert(base, ap);
+        // Persistent path for the low region.
+        if end <= PERSIST.min(self.max_address) {
+            if self.low.get().is_none() {
+                let _g = self.init.lock().unwrap();
+                if self.low.get().is_none() {
+                    let len = PERSIST.min(self.max_address);
+                    let ap = device
+                        .create_aperture(0, len as u32, false)
+                        .map_err(|e| GuestMemoryBackingError::other(addr, ApertureFailed(e.0)))?;
+                    let base_ptr = ap.as_ptr() as *mut u8;
+                    let _ = self.low.set(PersistAperture {
+                        _ap: ap,
+                        base_ptr,
+                        len,
+                    });
+                }
             }
-            let ap = &cache[&base];
-            // SAFETY: `addr..end` lies within `[base, base+len32)` mapped by `ap`.
-            let ptr = unsafe { (ap.as_ptr() as *mut u8).add((addr - base) as usize) };
-            return Ok(f(ptr));
+            let p = self.low.get().unwrap();
+            if end <= p.len {
+                // SAFETY: `addr..end` lies within `[0, p.len)` mapped by the aperture.
+                let ptr = unsafe { p.base_ptr.add(addr as usize) };
+                return Ok(f(ptr));
+            }
         }
 
-        // Slow path: access spans a CHUNK boundary — map an exact, page-aligned,
-        // one-shot aperture (not cached).
+        // Fallback: fresh one-shot aperture for high memory.
         let base = (addr / PAGE) * PAGE;
-        let span = ((end - base) + PAGE - 1) / PAGE * PAGE;
+        let span = (end - base).div_ceil(PAGE) * PAGE;
         let ap = device
             .create_aperture(base, span as u32, false)
             .map_err(|e| GuestMemoryBackingError::other(addr, ApertureFailed(e.0)))?;

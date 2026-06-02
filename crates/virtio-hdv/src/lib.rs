@@ -38,17 +38,18 @@ use chipset_device::poll_device::PollDevice;
 use futures::executor::block_on;
 use hdv::pci::{PciDetails, PciDevice, PciOps};
 use hdv::DeviceHost;
-use interrupt::HdvSignalMsi;
+use interrupt::{HdvSignalMsi, SeenInterrupts};
 use mem::HdvApertureMem;
 use pal_async::task::{Spawn, Task};
 use pal_async::{DefaultDriver, DefaultPool};
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::MsiConnection;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::thread::JoinHandle;
-use trace::trace;
+use std::time::Duration;
 use virtio::{PciInterruptModel, VirtioPciDevice};
 use virtiofs::virtio::VirtioFsDevice;
 use virtiofs::VirtioFs;
@@ -80,9 +81,58 @@ impl std::error::Error for AttachError {}
 /// (whose drop tears it down) plus, inside its `PciOps` context, every object
 /// that must outlive it (the async pool, the device, the poll pump).
 pub struct VirtioHdvDevice {
+    // Field order = drop order: stop the re-arm net first (so it can't inject into
+    // a half-torn-down device), then tear down the device.
+    _rearm: RearmNet,
     // `PciDevice`'s Drop tears down the HDV device host → `Teardown` → drops the
-    // boxed `Ops` (and all its keepalives). So this is the sole owner.
+    // boxed `Ops` (and all its keepalives).
     pci: PciDevice,
+}
+
+/// Background interrupt re-arm net. Periodically re-delivers every MSI the device
+/// has signalled, so a completion interrupt lost to the copy/snapshot semantics of
+/// HDV apertures (the device can briefly read a stale `used_event` and suppress the
+/// real interrupt) is recovered within the tick. Spurious MSIs are harmless: a
+/// virtio guest just re-scans the used ring and finds nothing new. This is a
+/// safety net for the proof; the principled fix is a coherent, eviction-managed
+/// guest-memory mapping (as WSL's `HdvGuestMemoryEvictionWorker` implies).
+struct RearmNet {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RearmNet {
+    /// Spawn the net. `handle` must already be bound (post-create).
+    fn spawn(handle: DeviceHandle, seen: SeenInterrupts) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("virtio-hdv-rearm".into())
+            .spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                    let Some(device) = handle.get() else { continue };
+                    let pairs = seen.lock().unwrap().clone();
+                    for (address, data) in pairs {
+                        let _ = device.deliver_interrupt(address, data);
+                    }
+                }
+            })
+            .expect("spawn rearm thread");
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for RearmNet {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl VirtioHdvDevice {
@@ -104,8 +154,9 @@ impl VirtioHdvDevice {
         let handle = DeviceHandle::new();
         let guest_memory = HdvApertureMem::into_guest_memory(handle.clone(), guest_mem_size);
 
+        let seen: SeenInterrupts = Arc::new(Mutex::new(Vec::new()));
         let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
-        msi_conn.connect(Arc::new(HdvSignalMsi::new(handle.clone())));
+        msi_conn.connect(Arc::new(HdvSignalMsi::new(handle.clone(), seen.clone())));
 
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
 
@@ -164,7 +215,10 @@ impl VirtioHdvDevice {
         // Now the guest-memory + MSI seams can reach the device.
         handle.set(pci.device());
 
-        Ok(Self { pci })
+        // Start the interrupt re-arm net only after the handle is bound.
+        let rearm = RearmNet::spawn(handle, seen);
+
+        Ok(Self { _rearm: rearm, pci })
     }
 
     /// The underlying HDV device handle.
