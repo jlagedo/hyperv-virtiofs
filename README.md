@@ -9,9 +9,11 @@ in-box device support.
 It is the open counterpart to the device-host glue that ships **closed** inside
 WSL's `wsldevicehost.dll`.
 
-> **Status: skeleton / work in progress.** The public C ABI is real and stable; the
-> HDV attach handshake is not yet wired (`hvfs_attach` returns
-> `HVFS_ERR_NOT_IMPLEMENTED`). See [Roadmap](#roadmap).
+> **Status: work in progress.** The public C ABI is stable, and the OpenVMM
+> `virtio` + `virtiofs` crates are **wired in and compiling** on Windows (the
+> reuse that avoids reimplementing a FUSE server — verified, not assumed). The
+> remaining work is the HDV transport bridge itself; until it lands, `hvfs_attach`
+> returns `HVFS_ERR_NOT_IMPLEMENTED`. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -73,11 +75,19 @@ services, and a bare name invites DLL-preloading. See
 
 ## Build
 
+Prerequisites: a Rust 1.95+ toolchain and **`protoc`** (the reused OpenVMM crates
+pull `mesh → prost → protobuf`, whose build needs the Protocol Buffers compiler).
+Install it from your package manager or the [protobuf releases](https://github.com/protocolbuffers/protobuf/releases),
+and ensure it's on `PATH` (or set the `PROTOC` env var to the binary).
+
 ```pwsh
 cargo build --release          # -> target/release/hyperv_virtiofs.dll (+ .dll.lib, .pdb)
 cargo test --workspace
 cbindgen --config cbindgen.toml --crate hyperv_virtiofs --output include/hyperv_virtiofs.h
 ```
+
+The OpenVMM crates are git dependencies pinned to one revision in the workspace
+`Cargo.toml`; the first build fetches that tree (large) and compiles it.
 
 CI (`windows-latest`) builds, clippy-gates, runs tests, and **fails if the committed
 header drifts** from the Rust source. Tagged `v*` pushes publish a GitHub release
@@ -86,15 +96,21 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
 
 ## Roadmap
 
-1. **HDV attach handshake** *(the linchpin)* — prove `HdvInitializeDeviceHost`
-   against an HCS compute system owned by the caller (by id or inherited handle),
-   surfacing a virtio-fs PCI device the guest enumerates. Until this lands,
-   `hvfs_attach` is `HVFS_ERR_NOT_IMPLEMENTED`.
-2. **OpenVMM transport seam** — adapt OpenVMM's `virtio` transport onto an
-   HDV-backed `GuestMemory` + external queue-notify.
-3. **virtio-fs server** — wire OpenVMM's `virtiofs` device, with a Windows
-   reparse/junction-safe directory jail.
-4. **`set_shares`** — live directory-map updates.
+- [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and
+  compiling on Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`,
+  `lx`/`lxutil` FUSE backend). The foundational feasibility question is answered.
+1. **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
+   `HdvCreateDeviceInstance`, guest-memory apertures, doorbells) and safe wrappers.
+2. **virtio-pci-over-HDV transport** — reimplement the virtio-pci modern
+   config-space machine (OpenVMM's `VirtioPciDevice` is too chipset-coupled to
+   reuse) driven by HDV callbacks; source `QueueResources` (memory ← apertures,
+   kick ← doorbells, IRQ ← HDV interrupt) and drive the reused `VirtioFsDevice`.
+3. **HDV attach handshake** *(the linchpin)* — prove `HdvInitializeDeviceHost`
+   against an HCS compute system owned by the caller, surfacing a virtio-fs PCI
+   device the guest enumerates. Until this lands, `hvfs_attach` is
+   `HVFS_ERR_NOT_IMPLEMENTED`.
+4. **`set_shares`** — live directory-map updates with a Windows reparse/junction-
+   safe directory jail.
 
 ## License
 

@@ -13,7 +13,23 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/jlagedo/hyperv-virtiofs"
 authors = ["hyperv-virtiofs contributors"]
-rust-version = "1.80"
+# OpenVMM's reused crates require Rust 1.95.
+rust-version = "1.95"
+
+# Reused OpenVMM device + transport-seam crates, pinned to one revision. The HDV
+# bridge (hdv-sys/hdv/virtio-hdv) is ours; the virtio device model, queue/guest-
+# memory machinery, and the virtio-fs FUSE server are reused, not reimplemented.
+# Not on crates.io, so these are git deps. NOTE: a git dep does NOT inherit the
+# source repo's [patch.crates-io]; if a transitive dep needs OpenVMM's bitvec/
+# pbjson patches, replicate them in [patch.crates-io] below.
+[workspace.dependencies]
+virtio = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+virtiofs = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+guestmem = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+vmcore = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+pal_event = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+pal_async = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+inspect = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 
 # A panic must never abort across the C ABI boundary: the cdylib catches it
 # (std::panic::catch_unwind) and returns an error code instead. unwind is the

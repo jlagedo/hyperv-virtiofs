@@ -11,11 +11,13 @@ rust-version.workspace = true
 [dependencies]
 hdv = { path = "../hdv" }
 
-# TODO(spike-2): add OpenVMM's transport crates once the seam is proven to accept
-# an external GuestMemory + queue-notify (design §7 unknown #2). Candidates:
-#   virtio       = { git = "https://github.com/microsoft/openvmm" }
-#   guestmem     = { git = "https://github.com/microsoft/openvmm" }
-# Vendored/pinned, not floating — these are not yet published to crates.io.
+# Reused OpenVMM seam crates (the transport drives a VirtioDevice via these).
+virtio.workspace = true
+guestmem.workspace = true
+vmcore.workspace = true
+pal_event.workspace = true
+pal_async.workspace = true
+inspect.workspace = true
 
 [features]
 link-hdv = ["hdv/link-hdv"]
