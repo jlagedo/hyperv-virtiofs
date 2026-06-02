@@ -18,6 +18,3 @@ vmcore.workspace = true
 pal_event.workspace = true
 pal_async.workspace = true
 inspect.workspace = true
-
-[features]
-link-hdv = ["hdv/link-hdv"]
