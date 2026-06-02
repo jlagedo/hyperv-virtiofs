@@ -67,6 +67,18 @@ unsafe extern "system" {
         options: PCWSTR,
     ) -> HRESULT;
 
+    /// Apply a settings modification to a running/created compute system — used to
+    /// **hot-add** a `FlexibleIov` device slot after the device host is registered
+    /// (the `ExternalRestricted` flow; cf. `microsoft/WSL` `hcs.cpp`
+    /// `HcsModifyComputeSystem`). `configuration` is a `ModifySettingRequest` JSON
+    /// document; `identity` is an optional impersonation token (may be null).
+    pub fn HcsModifyComputeSystem(
+        computeSystem: HCS_SYSTEM,
+        operation: HCS_OPERATION,
+        configuration: PCWSTR,
+        identity: *mut c_void,
+    ) -> HRESULT;
+
     pub fn HcsTerminateComputeSystem(
         computeSystem: HCS_SYSTEM,
         operation: HCS_OPERATION,
@@ -104,6 +116,14 @@ mod not_windows {
         E_NOTIMPL
     }
     pub unsafe fn HcsStartComputeSystem(_: HCS_SYSTEM, _: HCS_OPERATION, _: PCWSTR) -> HRESULT {
+        E_NOTIMPL
+    }
+    pub unsafe fn HcsModifyComputeSystem(
+        _: HCS_SYSTEM,
+        _: HCS_OPERATION,
+        _: PCWSTR,
+        _: *mut c_void,
+    ) -> HRESULT {
         E_NOTIMPL
     }
     pub unsafe fn HcsTerminateComputeSystem(_: HCS_SYSTEM, _: HCS_OPERATION, _: PCWSTR) -> HRESULT {

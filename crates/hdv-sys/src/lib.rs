@@ -171,6 +171,54 @@ unsafe extern "system" {
         deviceHostHandle: *mut HDV_HOST,
     ) -> HRESULT;
 
+    /// Register an **out-of-process** device host (a COM `IVmDeviceHost`) with a
+    /// compute system the caller owns, so the partition's FlexibleIov VID can
+    /// resolve a slot to it. This is the *host/broker-side* half of the
+    /// `ExternalRestricted` model (the device-host side calls
+    /// `HdvInitializeDeviceHostForProxy`). Signature transcribed from
+    /// `microsoft/WSL` `src/windows/inc/wdk.h` (the symbol is **not** in the public
+    /// `hypervdevicevirtualization.h`). `DeviceHost_IUnknown` is the device host's
+    /// `IVmDeviceHost` queried as `IUnknown*`; `TargetProcessId` is the process that
+    /// hosts it (may be the caller's own PID for an in-process device host);
+    /// `IpcSectionHandle` receives a shared-memory section handle for the data path.
+    pub fn HdvProxyDeviceHost(
+        computeSystem: HCS_SYSTEM,
+        deviceHostIUnknown: PVOID,
+        targetProcessId: u32,
+        ipcSectionHandle: *mut u64,
+    ) -> HRESULT;
+
+    /// Device-host-side counterpart to [`HdvProxyDeviceHost`]: create an HDV device
+    /// host that is **proxied** to a partition through the host's
+    /// `IVmDeviceHostSupport` callback — instead of bound to a compute system the
+    /// caller owns (the in-process [`HdvInitializeDeviceHost`] path). Internally it
+    /// builds the host, wraps it as an `IVmDeviceHost`, and invokes
+    /// `IVmDeviceHostSupport::RegisterDeviceHost` (which on the host side calls
+    /// [`HdvProxyDeviceHost`]).
+    ///
+    /// **Not** in the public `hypervdevicevirtualization.h`. Signature
+    /// reverse-engineered from `vmdevicehost.dll` (export RVA `0xC960`); see
+    /// `docs/hdv-proxy-abi.md`. `deviceHostSupport` is the host's
+    /// `IVmDeviceHostSupport` as `IUnknown*` (it is `QueryInterface`d for IID
+    /// `e31aa49b-0914-465e-b145-1b9ba13efb10`). `context` is a 64-bit value passed
+    /// to the device-host object's initializer — **unverified** type (pass null for
+    /// the first spike). `deviceHostHandle` receives the new host.
+    pub fn HdvInitializeDeviceHostForProxy(
+        context: PVOID,
+        deviceHostSupport: PVOID,
+        deviceHostHandle: *mut HDV_HOST,
+    ) -> HRESULT;
+
+    /// As [`HdvInitializeDeviceHostForProxy`] with an extra `flags` DWORD (export
+    /// RVA `0xCAA0`; the flags flow into the same device-host initializer). Same
+    /// reverse-engineering caveat.
+    pub fn HdvInitializeDeviceHostForProxyEx(
+        context: PVOID,
+        deviceHostSupport: PVOID,
+        flags: u32,
+        deviceHostHandle: *mut HDV_HOST,
+    ) -> HRESULT;
+
     pub fn HdvTeardownDeviceHost(deviceHostHandle: HDV_HOST) -> HRESULT;
 
     pub fn HdvCreateDeviceInstance(
@@ -246,6 +294,20 @@ mod not_windows {
     pub unsafe fn HdvInitializeDeviceHostEx(
         _: HCS_SYSTEM,
         _: HDV_DEVICE_HOST_FLAGS,
+        _: *mut HDV_HOST,
+    ) -> HRESULT {
+        E_NOTIMPL
+    }
+    pub unsafe fn HdvProxyDeviceHost(_: HCS_SYSTEM, _: PVOID, _: u32, _: *mut u64) -> HRESULT {
+        E_NOTIMPL
+    }
+    pub unsafe fn HdvInitializeDeviceHostForProxy(_: PVOID, _: PVOID, _: *mut HDV_HOST) -> HRESULT {
+        E_NOTIMPL
+    }
+    pub unsafe fn HdvInitializeDeviceHostForProxyEx(
+        _: PVOID,
+        _: PVOID,
+        _: u32,
         _: *mut HDV_HOST,
     ) -> HRESULT {
         E_NOTIMPL
