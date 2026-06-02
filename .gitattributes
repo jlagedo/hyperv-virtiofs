@@ -1,0 +1,10 @@
+# Keep text files LF in the working tree on every platform. Without this, the
+# Windows CI runner (core.autocrlf=true) checks the committed LF header out as
+# CRLF, while cbindgen regenerates LF — so the header-freshness gate mismatches.
+* text=auto eol=lf
+
+*.png binary
+*.dll binary
+*.lib binary
+*.pdb binary
+*.exp binary
