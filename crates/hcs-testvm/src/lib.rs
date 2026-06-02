@@ -297,6 +297,38 @@ impl RockyVm {
         Ok(())
     }
 
+    /// Apply a settings modification (`HcsModifyComputeSystem`) — used to **hot-add**
+    /// a `FlexibleIov` device slot after the device host is proxy-registered (the
+    /// `ExternalRestricted` flow). `configuration` is a `ModifySettingRequest` JSON
+    /// document (`{ResourcePath, RequestType, Settings}`).
+    pub fn modify(&self, configuration: &str) -> Result<(), String> {
+        // SAFETY: `self.system` is a live compute-system handle.
+        unsafe {
+            let op = hcs::HcsCreateOperation(std::ptr::null(), None);
+            if op.is_null() {
+                return Err("HcsCreateOperation returned null".into());
+            }
+            let hr = hcs::HcsModifyComputeSystem(
+                self.system,
+                op,
+                wide(configuration).as_ptr(),
+                std::ptr::null_mut(),
+            );
+            if hr < 0 {
+                let _ = run_op(op, "modify", 30_000);
+                hcs::HcsCloseOperation(op);
+                return Err(format!(
+                    "HcsModifyComputeSystem: HRESULT {:#010x}",
+                    hr as u32
+                ));
+            }
+            let done = run_op(op, "modify", 30_000);
+            hcs::HcsCloseOperation(op);
+            done?;
+        }
+        Ok(())
+    }
+
     /// Create and start the compute system in one step (the common path). On a
     /// start failure the created system is cleaned up by [`Drop`].
     pub fn boot(cfg: &RockyConfig) -> Result<Self, String> {

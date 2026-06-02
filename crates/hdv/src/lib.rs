@@ -13,6 +13,7 @@ use hdv_sys as sys;
 use std::ffi::c_void;
 
 pub mod pci;
+pub mod proxy;
 
 /// An HDV call failed. Carries the raw `HRESULT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,36 @@ impl DeviceHost {
         let mut handle: sys::HDV_HOST = std::ptr::null_mut();
         // SAFETY: caller guarantees a valid HCS_SYSTEM; `handle` is a valid out ptr.
         hr(unsafe { sys::HdvInitializeDeviceHostEx(compute_system, flags, &mut handle) })?;
+        Ok(Self { handle })
+    }
+
+    /// Create a **proxied** device host via `HdvInitializeDeviceHostForProxy`: the
+    /// host is bound to a compute system indirectly, through the
+    /// `IVmDeviceHostSupport` callback (`device_host_support`), which forwards the
+    /// device host to `HdvProxyDeviceHost` — the `ExternalRestricted` FlexibleIov
+    /// path (see [`proxy`] + `docs/hdv-proxy-abi.md`). `device_host_id` is the host
+    /// identity GUID HDV reads from the first argument — disassembly shows it is
+    /// copied via a 16-byte `movups`, so it **must** be a valid `*const GUID`, not
+    /// null.
+    ///
+    /// # Safety
+    /// `device_host_id` must point to a live `GUID`; `device_host_support` must be a
+    /// live `IVmDeviceHostSupport` `IUnknown*` (e.g.
+    /// [`proxy::DeviceHostSupport::as_iunknown`]) that outlives this device host.
+    pub unsafe fn from_proxy(
+        device_host_id: *const sys::GUID,
+        device_host_support: sys::PVOID,
+    ) -> Result<Self> {
+        let mut handle: sys::HDV_HOST = std::ptr::null_mut();
+        // SAFETY: caller guarantees a valid GUID + IVmDeviceHostSupport; `handle` is
+        // a valid out ptr.
+        hr(unsafe {
+            sys::HdvInitializeDeviceHostForProxy(
+                device_host_id as sys::PVOID,
+                device_host_support,
+                &mut handle,
+            )
+        })?;
         Ok(Self { handle })
     }
 

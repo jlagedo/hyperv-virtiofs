@@ -23,12 +23,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// unwinds across the FFI boundary into HDV.
 const E_FAIL: sys::HRESULT = 0x8000_4005u32 as sys::HRESULT;
 
-/// Spike-only stderr trace of HDV callback dispatch — pinpoints where HCS's
-/// FlexibleIov resource-reservation drives the emulator. Cheap; remove later.
-macro_rules! trace {
-    ($($t:tt)*) => { eprintln!("[hdv::pci] {}", format_args!($($t)*)) };
-}
-
 /// Fixed class/instance GUIDs for the spike's single device. (Milestone 2 will
 /// take these as parameters so a host can attach more than one device.)
 ///
@@ -48,6 +42,16 @@ pub const SPIKE_INSTANCE_ID: sys::GUID = sys::GUID {
     Data2: 0x0001,
     Data3: 0x4a7e,
     Data4: [0x9c, 0x00, 0xa7, 0xe1, 0x00, 0x00, 0x00, 0x02],
+};
+
+/// Device-**host** identity for the proxy path — the `ctx` argument of
+/// `HdvInitializeDeviceHostForProxy`, which (per disassembly) reads it as a 16-byte
+/// GUID and is **not** nullable. Distinct from the per-device class/instance ids.
+pub const SPIKE_HOST_ID: sys::GUID = sys::GUID {
+    Data1: 0xa7e1_1e40,
+    Data2: 0x0001,
+    Data3: 0x4a7e,
+    Data4: [0x9c, 0x00, 0xa7, 0xe1, 0x00, 0x00, 0x00, 0x03],
 };
 
 /// Format a GUID in canonical lowercase `8-4-4-4-12` form (no braces) — the form
@@ -163,14 +167,12 @@ fn guard_hr(f: impl FnOnce() -> sys::HRESULT) -> sys::HRESULT {
 }
 
 unsafe extern "system" fn tramp_initialize(_ctx: sys::PVOID) -> sys::HRESULT {
-    trace!("Initialize");
     sys::S_OK
 }
 
 unsafe extern "system" fn tramp_teardown(ctx: sys::PVOID) {
     // Reclaim the Context (and the vtable inside it). After this returns HDV must
     // not call any callback again. Swallow panics — Teardown cannot fail.
-    trace!("Teardown");
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !ctx.is_null() {
             drop(unsafe { Box::from_raw(ctx as *mut Context) });
@@ -183,7 +185,6 @@ unsafe extern "system" fn tramp_set_configuration(
     count: u32,
     values: *const sys::LPCWSTR,
 ) -> sys::HRESULT {
-    trace!("SetConfiguration count={count}");
     guard_hr(|| {
         let ops = unsafe { ops_of(ctx) };
         let mut owned: Vec<Vec<u16>> = Vec::new();
@@ -204,11 +205,6 @@ unsafe extern "system" fn tramp_get_details(
     probed_bars_count: u32,
     probed_bars: *mut u32,
 ) -> sys::HRESULT {
-    trace!(
-        "GetDetails pnp_id={} probed_bars_count={probed_bars_count} probed_bars={}",
-        if pnp_id.is_null() { "null" } else { "ok" },
-        if probed_bars.is_null() { "null" } else { "ok" },
-    );
     guard_hr(|| {
         let d = unsafe { ops_of(ctx) }.details();
         if !pnp_id.is_null() {
@@ -236,7 +232,6 @@ unsafe extern "system" fn tramp_get_details(
 }
 
 unsafe extern "system" fn tramp_start(ctx: sys::PVOID) -> sys::HRESULT {
-    trace!("Start");
     guard_hr(|| {
         if unsafe { ops_of(ctx) }.start() {
             sys::S_OK
@@ -255,7 +250,6 @@ unsafe extern "system" fn tramp_read_config(
     offset: u32,
     value: *mut u32,
 ) -> sys::HRESULT {
-    trace!("ReadConfigSpace offset={offset:#x}");
     guard_hr(|| {
         let v = unsafe { ops_of(ctx) }.read_config(offset);
         if !value.is_null() {

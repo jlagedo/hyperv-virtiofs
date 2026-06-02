@@ -52,10 +52,10 @@ How the disasm yields each (incoming x64 args = rcx, rdx, r8, r9):
 - **`HdvInitializeDeviceHostForProxyEx`** — same, plus `r8d` (DWORD flags) flows into the ctor's 4th
   arg (`F7FC(&out, &support, ctx, flags)`) and `r9` is the `HDV_HOST*` out.
 
-`ctx` (the first arg of both `…ForProxy…`) is a 64-bit value handed to the device-host object's
-initializer (`F7FC` → `Init(obj, ctx, flags)`); its exact type is **unverified** (the non-proxy
-`HdvInitializeDeviceHost` passes a constant `1` in the analogous slot). Treat as an optional `PVOID`
-and pass null for the first spike; revisit if init fails.
+`ctx` (the first arg of both `…ForProxy…`) is a **`*const GUID`** — the device-host **identity**.
+`Init` (`E808`) reads it with a 16-byte `movups xmm0,[rbp]` and copies it into the device-host record,
+so it is **not nullable** (passing null faults). Confirmed by spike: null → `STATUS_ACCESS_VIOLATION`;
+a valid `*const GUID` → success. Distinct from the per-device class/instance ids.
 
 ## COM interfaces (from WSL `src/windows/service/inc/windowsdefs.idl`)
 
@@ -77,13 +77,23 @@ The COM activation CLSIDs WSL registers (`WslDeviceHost_VirtioFs {60285AE6-…}`
 how WSL sandboxes its device host out-of-process; they are *not* part of the HDV/HCS contract. An
 in-process device host needs none of it.
 
-## Open items before a working spike
+## Proven end-to-end (2026-06-02, `hcs-testvm/tests/attach_proxy.rs`)
 
-1. Implement two COM objects in Rust: `IVmDeviceHost` (our device host) and `IVmDeviceHostSupport` (our
-   `RegisterDeviceHost` → `HdvProxyDeviceHost`). Minimal hand-rolled vtables (`#[repr(C)]` +
-   `extern "system"` thunks, like `hdv::pci`).
-2. Bind/verify `HcsModifyComputeSystem` use for the hot-add (already bound in `hcs-sys`).
-3. Resolve `ctx` (arg1) empirically; resolve what `HDV_HOST` from the proxy path expects for
-   `HdvCreateDeviceInstance` (likely identical to the in-process host).
-4. `GetDeviceInstance` must return an `IUnknown` the VID accepts — likely the device exposed by
-   `HdvCreateDeviceInstance` (or an object `vmdevicehost` produces). Confirm during the spike.
+The spike drives the whole path in one process and **passes**:
+
+1. We implement **only** `IVmDeviceHostSupport` (`hdv::proxy::DeviceHostSupport`) — `RegisterDeviceHost`
+   → `HdvProxyDeviceHost`. The `IVmDeviceHost` is built by HDV inside `ForProxy` and handed to us as a
+   parameter, so we never author it (one COM object, not two).
+2. `HcsModifyComputeSystem` is bound (`hcs-sys`) and works for the hot-add; the slot may equivalently
+   be declared in the create document (cold) — both reservation paths succeed once the device host is
+   proxy-registered.
+3. `ctx` resolved: a non-null `*const GUID` (device-host id) — see above.
+4. The proxy `HDV_HOST` takes `HdvCreateDeviceInstance` exactly like the in-process host. The VID drives
+   the device `Initialize → SetConfiguration → GetDetails → Start → ReadConfigSpace`, and `GetDeviceInstance`
+   is handled by HDV's own `IVmDeviceHost` wrapper — we never see it.
+
+Guest side: the device surfaces over **VMBus VPCI**, so the guest needs `hv_vmbus` + `pci-hyperv`
+loaded. With them, the guest logs `hv_pci <instanceId>: PCI host bridge to bus 0001:00` and
+`pci 0001:00:00.0: [1af4:1100]`. Outcome: the `ExternalRestricted` FlexibleIov path works in-process;
+the design §7 #1 linchpin is retired. Remaining for the product: swap the driverless `SpikeDevice` for
+the OpenVMM `VirtioFsDevice` (task #8) and ensure the cage guest image loads the VPCI modules.
