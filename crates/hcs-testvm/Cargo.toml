@@ -12,6 +12,10 @@ rust-version.workspace = true
 hcs-sys = { path = "../hcs-sys" }
 serde_json = "1"
 
+[dev-dependencies]
+# The attach spike drives a minimal HDV PCI device against the live HCS_SYSTEM.
+hdv = { path = "../hdv" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

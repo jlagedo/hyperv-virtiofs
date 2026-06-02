@@ -12,6 +12,8 @@
 use hdv_sys as sys;
 use std::ffi::c_void;
 
+pub mod pci;
+
 /// An HDV call failed. Carries the raw `HRESULT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub sys::HRESULT);
@@ -55,6 +57,23 @@ impl DeviceHost {
         let mut handle: sys::HDV_HOST = std::ptr::null_mut();
         // SAFETY: caller guarantees a valid HCS_SYSTEM; `handle` is a valid out ptr.
         hr(unsafe { sys::HdvInitializeDeviceHost(compute_system, &mut handle) })?;
+        Ok(Self { handle })
+    }
+
+    /// Like [`open`](Self::open) but via `HdvInitializeDeviceHostEx`, so flags can
+    /// be passed — notably [`HDV_DEVICE_HOST_FLAGS::InitializeComSecurity`], which
+    /// the FlexibleIov resource-reservation path appears to require (vmwp invokes
+    /// the emulator over COM).
+    ///
+    /// # Safety
+    /// As [`open`](Self::open).
+    pub unsafe fn open_ex(
+        compute_system: sys::HCS_SYSTEM,
+        flags: sys::HDV_DEVICE_HOST_FLAGS,
+    ) -> Result<Self> {
+        let mut handle: sys::HDV_HOST = std::ptr::null_mut();
+        // SAFETY: caller guarantees a valid HCS_SYSTEM; `handle` is a valid out ptr.
+        hr(unsafe { sys::HdvInitializeDeviceHostEx(compute_system, flags, &mut handle) })?;
         Ok(Self { handle })
     }
 

@@ -59,6 +59,14 @@ The lower three crates are a reusable "HDV device toolkit"; virtio-fs is just th
 first device on top. They can be split to crates.io later if a second device wants
 them.
 
+This layering mirrors WSL's closed `wsldevicehost.dll` (1.6 MB, Rust). Its embedded
+source paths split by depot prefix: **`oss\…`** = the public `microsoft/openvmm` tree
+(`virtio`, `virtiofs`, `pci_core`, `fuse`, `lxutil`, `guestmem` — exactly what we reuse),
+and **`hyper-v\…`** = Microsoft's internal Windows depot (not mirrored): an `hdv` crate
+(`api.rs` ≈ our `hdv-sys`+`hdv`; `virtio_hdv.rs` ≈ our `virtio-hdv`; `virtiofs.rs` ≈ the
+`cdylib` wiring) plus a `wsldevicehost` COM/DLL shim we don't need. So `virtio-hdv` is the
+open re-implementation of one internal file (`virtio_hdv.rs`) over otherwise-public crates.
+
 ## Bindings — there are none here, on purpose
 
 This repo ships the **DLL + import lib + the C header**. Language bindings live with
@@ -101,14 +109,19 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
   `lx`/`lxutil` FUSE backend). The foundational feasibility question is answered.
 1. **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
    `HdvCreateDeviceInstance`, guest-memory apertures, doorbells) and safe wrappers.
-2. **virtio-pci-over-HDV transport** — reimplement the virtio-pci modern
-   config-space machine (OpenVMM's `VirtioPciDevice` is too chipset-coupled to
-   reuse) driven by HDV callbacks; source `QueueResources` (memory ← apertures,
-   kick ← doorbells, IRQ ← HDV interrupt) and drive the reused `VirtioFsDevice`.
-3. **HDV attach handshake** *(the linchpin)* — prove `HdvInitializeDeviceHost`
-   against an HCS compute system owned by the caller, surfacing a virtio-fs PCI
-   device the guest enumerates. Until this lands, `hvfs_attach` is
-   `HVFS_ERR_NOT_IMPLEMENTED`.
+2. **HDV attach handshake** *(the linchpin)* — prove `HdvInitializeDeviceHost`
+   against an HCS compute system owned by the caller, surfacing a PCI device the
+   guest enumerates (spike: a minimal device, no virtio). Resolves whether the
+   in-process model needs a compute-system device slot. Until the transport lands,
+   `hvfs_attach` is `HVFS_ERR_NOT_IMPLEMENTED`.
+3. **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: OpenVMM's
+   `VirtioPciDevice` is public (`virtio::VirtioPciDevice`, re-exported from the
+   `transport` module) and `VirtioPciDevice::new` takes exactly the seams HDV
+   provides — `GuestMemory` (← apertures via `GuestMemoryAccess`), `DoorbellRegistration`
+   (← `HdvRegisterDoorbell`), `PciInterruptModel::Msix` (← `HdvDeliverGuestInterrupt`),
+   `RegisterMmioIntercept` (← HDV BAR callbacks). Wire those ~4 adapters and drive the
+   reused `VirtioFsDevice`. (Confirmed by forensics of `wsldevicehost.dll`, whose own
+   `hyper-v\hdv\src\virtio_hdv.rs` reuses these same public crates.)
 4. **`set_shares`** — live directory-map updates with a Windows reparse/junction-
    safe directory jail.
 

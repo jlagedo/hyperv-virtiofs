@@ -26,6 +26,31 @@ const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// An HCS `FlexibleIov` device slot. Declaring one gives the Linux guest a VPCI
+/// bus over VMBus (enumerated by `pci-hyperv`) onto which an in-process HDV device
+/// surfaces. The GUIDs must match the HDV device: `instance_guid` is the slot's
+/// map-key and equals the HDV `DeviceInstanceId`; `emulator_id` equals the HDV
+/// `DeviceClassId`.
+#[derive(Clone)]
+pub struct FlexibleIovSlot {
+    pub instance_guid: String,
+    pub emulator_id: String,
+    pub hosting_model: String,
+}
+
+impl FlexibleIovSlot {
+    /// A slot with the only attested `HostingModel`, `ExternalRestricted` (the
+    /// in-process attach spike confirmed `HdvInitializeDeviceHost` works under it
+    /// for a system we own).
+    pub fn new(instance_guid: impl Into<String>, emulator_id: impl Into<String>) -> Self {
+        Self {
+            instance_guid: instance_guid.into(),
+            emulator_id: emulator_id.into(),
+            hosting_model: "ExternalRestricted".into(),
+        }
+    }
+}
+
 /// What to boot.
 pub struct RockyConfig {
     pub kernel_path: String,
@@ -33,6 +58,8 @@ pub struct RockyConfig {
     pub kernel_cmdline: String,
     pub memory_mb: u32,
     pub processor_count: u32,
+    /// Optional HDV device slot to declare in the compute-system document.
+    pub flexible_iov: Option<FlexibleIovSlot>,
 }
 
 impl RockyConfig {
@@ -45,7 +72,15 @@ impl RockyConfig {
             kernel_cmdline: "console=ttyS0".into(),
             memory_mb: 4096,
             processor_count: 2,
+            flexible_iov: None,
         }
+    }
+
+    /// Declare a `FlexibleIov` device slot (so an HDV device gets a VPCI bus to
+    /// appear on). See [`FlexibleIovSlot`].
+    pub fn with_flexible_iov(mut self, slot: FlexibleIovSlot) -> Self {
+        self.flexible_iov = Some(slot);
+        self
     }
 }
 
@@ -68,6 +103,22 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn build_document(cfg: &RockyConfig, console_pipe: &str) -> String {
+    let mut devices = serde_json::json!({
+        "ComPorts": { "0": { "NamedPipe": console_pipe } }
+    });
+    if let Some(slot) = &cfg.flexible_iov {
+        // Devices.FlexibleIov is a map keyed by the device instance GUID.
+        let mut map = serde_json::Map::new();
+        map.insert(
+            slot.instance_guid.clone(),
+            serde_json::json!({
+                "EmulatorId": slot.emulator_id,
+                "HostingModel": slot.hosting_model,
+            }),
+        );
+        devices["FlexibleIov"] = serde_json::Value::Object(map);
+    }
+
     serde_json::json!({
         "Owner": "hyperv-virtiofs-test",
         "SchemaVersion": { "Major": 2, "Minor": 1 },
@@ -84,9 +135,7 @@ fn build_document(cfg: &RockyConfig, console_pipe: &str) -> String {
                 "Memory": { "SizeInMB": cfg.memory_mb },
                 "Processor": { "Count": cfg.processor_count }
             },
-            "Devices": {
-                "ComPorts": { "0": { "NamedPipe": console_pipe } }
-            }
+            "Devices": devices
         }
     })
     .to_string()
@@ -121,10 +170,12 @@ unsafe fn run_op(op: hcs::HCS_OPERATION, what: &str, timeout_ms: u32) -> Result<
 }
 
 impl RockyVm {
-    /// Create and start the compute system, returning once HCS reports the start
-    /// operation complete. The guest is then booting; use [`wait_for_console`] to
-    /// watch its serial output.
-    pub fn boot(cfg: &RockyConfig) -> Result<Self, String> {
+    /// Create the compute system **without starting it**. The guest is not yet
+    /// running, but the system exists and [`system_handle`](Self::system_handle)
+    /// is valid — so an HDV device host can attach a device *before boot* (the
+    /// device is then present for the guest's first PCI enumeration). Pair with
+    /// [`start`](Self::start), or use [`boot`](Self::boot) for create+start.
+    pub fn create(cfg: &RockyConfig) -> Result<Self, String> {
         let id = format!(
             "hvfs-test-{}-{}",
             std::process::id(),
@@ -139,7 +190,7 @@ impl RockyVm {
         let document = build_document(cfg, &pipe_name);
 
         // SAFETY: all handles below are checked; wide strings outlive the calls.
-        unsafe {
+        let system = unsafe {
             let create_op = hcs::HcsCreateOperation(std::ptr::null(), None);
             if create_op.is_null() {
                 return Err("HcsCreateOperation returned null".into());
@@ -160,34 +211,52 @@ impl RockyVm {
                     hr as u32
                 ));
             }
-            run_op(create_op, "create", 60_000)?;
+            let created = run_op(create_op, "create", 60_000);
             hcs::HcsCloseOperation(create_op);
+            created?;
+            system
+        };
 
+        Ok(Self {
+            id,
+            system,
+            console,
+            reader: Some(reader),
+            pipe,
+        })
+    }
+
+    /// Start the already-created compute system, returning once HCS reports the
+    /// start operation complete. The guest is then booting; use
+    /// [`wait_for_console`](Self::wait_for_console) to watch its serial output.
+    pub fn start(&self) -> Result<(), String> {
+        // SAFETY: `self.system` is a live, created compute system handle.
+        unsafe {
             let start_op = hcs::HcsCreateOperation(std::ptr::null(), None);
-            let hr = hcs::HcsStartComputeSystem(system, start_op, std::ptr::null());
+            if start_op.is_null() {
+                return Err("HcsCreateOperation returned null".into());
+            }
+            let hr = hcs::HcsStartComputeSystem(self.system, start_op, std::ptr::null());
             if hr < 0 {
                 hcs::HcsCloseOperation(start_op);
-                hcs::HcsCloseComputeSystem(system);
                 return Err(format!(
                     "HcsStartComputeSystem: HRESULT {:#010x}",
                     hr as u32
                 ));
             }
-            let start = run_op(start_op, "start", 60_000);
+            let started = run_op(start_op, "start", 60_000);
             hcs::HcsCloseOperation(start_op);
-            if let Err(e) = start {
-                hcs::HcsCloseComputeSystem(system);
-                return Err(e);
-            }
-
-            Ok(Self {
-                id,
-                system,
-                console,
-                reader: Some(reader),
-                pipe,
-            })
+            started?;
         }
+        Ok(())
+    }
+
+    /// Create and start the compute system in one step (the common path). On a
+    /// start failure the created system is cleaned up by [`Drop`].
+    pub fn boot(cfg: &RockyConfig) -> Result<Self, String> {
+        let vm = Self::create(cfg)?;
+        vm.start()?;
+        Ok(vm)
     }
 
     /// The live compute-system handle, for `HdvInitializeDeviceHost`.

@@ -12,9 +12,15 @@
 //! It is **device-neutral**: virtio-fs, virtio-blk, virtio-console all ride it.
 //! `hyperv_virtiofs` is the first consumer.
 //!
-//! Status: SKELETON. The adapter shape depends on spike-2 (does OpenVMM's `virtio`
-//! transport seam accept an external memory + notify source, or does it assume its
-//! own PCI front end?). Design §7 unknown #2.
+//! Status: SKELETON — milestone 2. The shape is now decided (design §7 unknown #2
+//! is **resolved**, see `windows-virtiofs-hdv.md` §4 "Correction²" + Appendix B):
+//! the generic HDV PCI device + callback vtable live in [`hdv::pci`]; this crate
+//! implements [`hdv::pci::PciOps`] by driving OpenVMM's **public** `VirtioPciDevice`
+//! — backing its `GuestMemory` with `hdv` apertures (via `GuestMemoryAccess`),
+//! its `DoorbellRegistration` with `HdvRegisterDoorbell`, its `PciInterruptModel`
+//! with `HdvDeliverGuestInterrupt`, and its `RegisterMmioIntercept` with the HDV
+//! BAR callbacks. The attach spike (`hcs-testvm`) exercises `hdv::pci` directly
+//! with a trivial device first; this crate fills in once that handshake is proven.
 
 use hdv::DeviceHost;
 
@@ -28,8 +34,8 @@ impl VirtioHdvDevice {
     /// Bind a virtio device of the given `device_id` onto an HDV device host.
     /// `device_id` is the virtio PCI device id (0x1a == virtio-fs).
     pub fn new(host: DeviceHost, _device_id: u16) -> Self {
-        // TODO(spike-2): create the hdv DeviceInstance with virtio-fs PCI ids,
-        // wire config space, apertures, and doorbells to OpenVMM's transport.
+        // TODO(milestone-2): implement hdv::pci::PciOps over OpenVMM's
+        // VirtioPciDevice (GuestMemory ← apertures, doorbells, MSI, BAR intercepts).
         Self { _host: host }
     }
 }

@@ -443,6 +443,7 @@ name = "hcs-testvm"
 version = "0.1.0"
 dependencies = [
  "hcs-sys",
+ "hdv",
  "serde_json",
  "windows-sys 0.59.0",
 ]
