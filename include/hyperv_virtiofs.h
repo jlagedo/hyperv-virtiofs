@@ -48,6 +48,17 @@ uint32_t hvfs_abi_version(void);
  * Non-blocking: serving runs on the DLL's own threads. On success `*out` holds a
  * handle to pass to [`hvfs_set_shares`] / [`hvfs_detach`].
  *
+ * `device_json` is the initial share + guest memory:
+ * `{ "tag": "ws", "path": "C:\\host\\dir", "ro": false, "memory_mb": 512 }`
+ * — `tag` is the virtio-fs mount tag, `path` the host directory, `ro` is accepted
+ * but not yet enforced, and `memory_mb` must equal the compute system's RAM.
+ *
+ * The caller's compute-system document **must** pre-declare a `FlexibleIov` slot
+ * whose map-key GUID is the well-known `HVFS_DEVICE_INSTANCE_ID` and whose
+ * `EmulatorId` is `HVFS_DEVICE_CLASS_ID`, `HostingModel` `"ExternalRestricted"`
+ * (see `hdv::pci`). Those device GUIDs are fixed today — making them caller-chosen
+ * is a tracked follow-up.
+ *
  * # Safety
  * `hcs_system_id` and `device_json` must be valid NUL-terminated C strings;
  * `out` must be a valid, writable `*mut *mut hvfs_device`.

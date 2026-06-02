@@ -28,7 +28,7 @@
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
-use hdv::pci::{guid_to_string, SPIKE_CLASS_ID, SPIKE_INSTANCE_ID};
+use hdv::pci::{guid_to_string, HVFS_DEVICE_CLASS_ID, HVFS_DEVICE_INSTANCE_ID};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,8 +53,8 @@ fn attaches_hdv_pci_device_out_of_process() {
     // device the child creates (map-key == DeviceInstanceId, EmulatorId ==
     // DeviceClassId — both minted in `hdv::pci`).
     let cfg = RockyConfig::new(kernel, initrd).with_flexible_iov(FlexibleIovSlot::new(
-        guid_to_string(&SPIKE_INSTANCE_ID),
-        guid_to_string(&SPIKE_CLASS_ID),
+        guid_to_string(&HVFS_DEVICE_INSTANCE_ID),
+        guid_to_string(&HVFS_DEVICE_CLASS_ID),
     ));
 
     // Create (but do not start). The device host is opened by the CHILD, not here.

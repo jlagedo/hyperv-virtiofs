@@ -9,15 +9,15 @@ in-box device support.
 It is the open counterpart to the device-host glue that ships **closed** inside
 WSL's `wsldevicehost.dll`.
 
-> **Status: the core is proven.** A stock Rocky Linux 10 (EL10) guest under
+> **Status: it works through the C ABI.** A stock Rocky Linux 10 (EL10) guest under
 > Hyper-V/HCS **mounts a host directory over our HDV virtio-fs bridge** — reads a
-> host file and writes one back — with no 9p and no kernel changes
-> (`hcs-testvm/tests/attach_virtiofs.rs`, `PROOF_COMPLETE_PASS`). The transport
-> (`virtio-hdv`) drives OpenVMM's public `VirtioPciDevice`/`VirtioFsDevice` over
-> the `ExternalRestricted` FlexibleIov proxy path. Remaining for product use:
-> wire `hvfs_attach` (still `HVFS_ERR_NOT_IMPLEMENTED`), live `set_shares`, and a
-> fully coherent guest-memory mapping (HDV apertures are an evictable cache; the
-> proof uses a persistent mapping + interrupt re-arm + boot retry to mask the
+> host file and writes one back — with no 9p and no kernel changes, driven entirely
+> through the exported `hvfs_attach` (`hcs-testvm/tests/attach_abi.rs`,
+> `PROOF_COMPLETE_PASS`). The transport (`virtio-hdv`) drives OpenVMM's public
+> `VirtioPciDevice`/`VirtioFsDevice` over the `ExternalRestricted` FlexibleIov proxy
+> path. Remaining for product use: live `set_shares`, caller-supplied device GUIDs,
+> and a fully coherent guest-memory mapping (HDV apertures are an evictable cache;
+> the proof uses a persistent mapping + interrupt re-arm + boot retry to mask the
 > residual staleness). See [Roadmap](#roadmap).
 
 ## Why
@@ -50,6 +50,21 @@ Contract rules: `0` = OK / `< 0` = error (details in the thread-local
 `hvfs_last_error`); opaque handles; **every** `const char*` is borrowed (no caller
 `free`); and **no Rust panic ever crosses the boundary** — every entry point runs
 under `catch_unwind` and returns `HVFS_ERR_PANIC` instead of aborting the host.
+
+`hvfs_attach`'s `device_json` carries the initial share + guest memory:
+
+```json
+{ "tag": "ws", "path": "C:\\host\\dir", "ro": false, "memory_mb": 512 }
+```
+
+`tag` is the virtio-fs mount tag (`mount -t virtiofs <tag> …`), `path` the host
+directory, `ro` is accepted but **not yet enforced**, and `memory_mb` must equal the
+compute system's RAM (the GPA ceiling the device's DMA may reference). The caller's
+own compute-system document **must pre-declare a `FlexibleIov` slot** whose map-key
+GUID is the well-known `HVFS_DEVICE_INSTANCE_ID` and whose `EmulatorId` is
+`HVFS_DEVICE_CLASS_ID`, with `HostingModel: "ExternalRestricted"` (both GUIDs live in
+`hdv::pci`). Those device GUIDs are fixed product constants today — see the
+caller-supplied-GUIDs follow-up in the [Roadmap](#roadmap).
 
 ## Crate layering
 
@@ -127,8 +142,16 @@ carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consu
   BAR bases, since the VMBus VID owns guest-facing BAR placement). Drives the reused
   `VirtioFsDevice`; the guest mounts and does file I/O. (`shmem_size = 0` → no DAX
   BAR yet.)
-- [ ] **Wire `hvfs_attach`** — call `VirtioHdvDevice::attach` from the cdylib
-  (currently `HVFS_ERR_NOT_IMPLEMENTED`).
+- [x] **Wire `hvfs_attach`** — the cdylib opens the compute system
+  (`HcsOpenComputeSystem`), proxy-registers an HDV device host, and calls
+  `VirtioHdvDevice::attach`; a guest mounts the share via `device_json` through the
+  shipped ABI (`hcs-testvm/tests/attach_abi.rs`, `PROOF_COMPLETE_PASS`). The initial
+  share rides in `device_json` (live updates are `set_shares`, below).
+- [ ] **Caller-supplied device GUIDs** — today host/class/instance are built-in
+  well-known constants (`hdv::pci`) the consumer must mirror in its `FlexibleIov`
+  slot, so only one such device can exist per guest. Let the host override them via
+  `device_json`, threading the ids through `attach` / `from_proxy` /
+  `PciDevice::create`.
 - [ ] **Coherent guest memory** — participate in HDV's aperture eviction protocol
   (à la WSL's `HdvGuestMemoryEvictionWorker`) for a fully coherent, zero-copy mapping
   (replacing the persistent-aperture + re-arm + retry mitigation).

@@ -30,7 +30,9 @@
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
-use hdv::pci::{guid_to_string, SPIKE_CLASS_ID, SPIKE_HOST_ID, SPIKE_INSTANCE_ID};
+use hdv::pci::{
+    guid_to_string, HVFS_DEVICE_CLASS_ID, HVFS_DEVICE_HOST_ID, HVFS_DEVICE_INSTANCE_ID,
+};
 use hdv::proxy::DeviceHostSupport;
 use hdv::DeviceHost;
 use std::time::Duration;
@@ -87,11 +89,11 @@ fn guest_mounts_virtiofs_over_hdv() {
 /// whether the proof sentinel was seen.
 fn try_boot_and_mount(kernel: &str, initrd: &str, ws: &std::path::Path) -> bool {
     // Cold path: declare the FlexibleIov slot in the create document (its
-    // EmulatorId == the HDV DeviceClassId our device uses, == SPIKE_CLASS_ID),
+    // EmulatorId == the HDV DeviceClassId our device uses, == HVFS_DEVICE_CLASS_ID),
     // then proxy-register the device host before start.
     let cfg = RockyConfig::new(kernel, initrd).with_flexible_iov(FlexibleIovSlot::new(
-        guid_to_string(&SPIKE_INSTANCE_ID),
-        guid_to_string(&SPIKE_CLASS_ID),
+        guid_to_string(&HVFS_DEVICE_INSTANCE_ID),
+        guid_to_string(&HVFS_DEVICE_CLASS_ID),
     ));
     let vm = RockyVm::create(&cfg).expect("create Rocky compute system");
     eprintln!("compute system id: {}", vm.id());
@@ -99,7 +101,7 @@ fn try_boot_and_mount(kernel: &str, initrd: &str, ws: &std::path::Path) -> bool 
     // Proxy-register the device host (the proven ExternalRestricted path).
     // SAFETY: the VM (hence its system handle) outlives `support` and the device.
     let support = unsafe { DeviceHostSupport::new(vm.system_handle()) };
-    let host = unsafe { DeviceHost::from_proxy(&SPIKE_HOST_ID, support.as_iunknown()) }
+    let host = unsafe { DeviceHost::from_proxy(&HVFS_DEVICE_HOST_ID, support.as_iunknown()) }
         .unwrap_or_else(|e| panic!("HdvInitializeDeviceHostForProxy failed: {e}"));
     eprintln!(
         "proxy host created; registered={} register_hr={:#010x}",

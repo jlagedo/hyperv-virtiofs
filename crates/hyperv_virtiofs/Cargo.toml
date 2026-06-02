@@ -16,6 +16,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 hdv = { path = "../hdv" }
 virtio-hdv = { path = "../virtio-hdv" }
+# Turns the externally-owned compute-system *id* the caller passes into the live
+# HCS_SYSTEM handle the HDV proxy path attaches to (HcsOpenComputeSystem).
+hcs-sys = { path = "../hcs-sys" }
 
 # Reused OpenVMM virtio-fs device (FUSE server + Windows NT-backed file ops). This
 # is the crate whose reuse avoids reimplementing a virtio-fs server from scratch.

@@ -19,6 +19,11 @@ hdv = { path = "../hdv" }
 # OpenVMM transport instead of the trivial SpikeDevice.
 virtio-hdv = { path = "../virtio-hdv" }
 
+[dev-dependencies]
+# `tests/attach_abi.rs` drives the cdylib's exported C ABI (hvfs_attach/hvfs_detach)
+# end-to-end — links it in-process via its rlib output.
+hyperv_virtiofs = { path = "../hyperv_virtiofs" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

@@ -444,6 +444,7 @@ version = "0.1.0"
 dependencies = [
  "hcs-sys",
  "hdv",
+ "hyperv_virtiofs",
  "serde_json",
  "virtio-hdv",
  "windows-sys 0.59.0",
@@ -501,6 +502,7 @@ dependencies = [
 name = "hyperv_virtiofs"
 version = "0.1.0"
 dependencies = [
+ "hcs-sys",
  "hdv",
  "pal_async",
  "serde",

@@ -32,7 +32,9 @@
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm, SpikeDevice};
-use hdv::pci::{guid_to_string, PciDevice, SPIKE_CLASS_ID, SPIKE_HOST_ID, SPIKE_INSTANCE_ID};
+use hdv::pci::{
+    guid_to_string, PciDevice, HVFS_DEVICE_CLASS_ID, HVFS_DEVICE_HOST_ID, HVFS_DEVICE_INSTANCE_ID,
+};
 use hdv::proxy::DeviceHostSupport;
 use hdv::DeviceHost;
 use std::io::Write;
@@ -65,8 +67,8 @@ fn attaches_via_hdv_proxy() {
     // initramfs init), and proxy-register the device host BEFORE start so the start
     // reservation resolves the slot to our device.
     let cfg = RockyConfig::new(kernel, initrd).with_flexible_iov(FlexibleIovSlot::new(
-        guid_to_string(&SPIKE_INSTANCE_ID),
-        guid_to_string(&SPIKE_CLASS_ID),
+        guid_to_string(&HVFS_DEVICE_INSTANCE_ID),
+        guid_to_string(&HVFS_DEVICE_CLASS_ID),
     ));
     let vm = RockyVm::create(&cfg).expect("create Rocky compute system");
     eprintln!("compute system id: {}", vm.id());
@@ -76,7 +78,7 @@ fn attaches_via_hdv_proxy() {
     // SAFETY: the VM (hence its system handle) outlives `support` and `device`.
     let support = unsafe { DeviceHostSupport::new(vm.system_handle()) };
     mark("calling HdvInitializeDeviceHostForProxy (pre-start)");
-    let host = unsafe { DeviceHost::from_proxy(&SPIKE_HOST_ID, support.as_iunknown()) }
+    let host = unsafe { DeviceHost::from_proxy(&HVFS_DEVICE_HOST_ID, support.as_iunknown()) }
         .unwrap_or_else(|e| panic!("HdvInitializeDeviceHostForProxy failed: {e}"));
     eprintln!(
         "proxy host created; registered={} register_hr={:#010x} pid={} ipc={:#x}",

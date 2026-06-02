@@ -22,7 +22,7 @@
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm, SpikeDevice};
-use hdv::pci::{guid_to_string, PciDevice, SPIKE_CLASS_ID, SPIKE_INSTANCE_ID};
+use hdv::pci::{guid_to_string, PciDevice, HVFS_DEVICE_CLASS_ID, HVFS_DEVICE_INSTANCE_ID};
 use hdv::DeviceHost;
 use std::time::Duration;
 
@@ -46,8 +46,8 @@ fn attaches_hdv_pci_device() {
     // The slot's GUIDs must match the HDV device: map-key == DeviceInstanceId,
     // EmulatorId == DeviceClassId (both minted in `hdv::pci`).
     let cfg = RockyConfig::new(kernel, initrd).with_flexible_iov(FlexibleIovSlot::new(
-        guid_to_string(&SPIKE_INSTANCE_ID),
-        guid_to_string(&SPIKE_CLASS_ID),
+        guid_to_string(&HVFS_DEVICE_INSTANCE_ID),
+        guid_to_string(&HVFS_DEVICE_CLASS_ID),
     ));
 
     // Create (but do not start) the VM, then attach the HDV device while the guest

@@ -23,21 +23,24 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// unwinds across the FFI boundary into HDV.
 const E_FAIL: sys::HRESULT = 0x8000_4005u32 as sys::HRESULT;
 
-/// Fixed class/instance GUIDs for the spike's single device. (Milestone 2 will
-/// take these as parameters so a host can attach more than one device.)
+/// The product's **well-known** device class/instance GUIDs. These are fixed
+/// constants (Decision A): a consumer must declare its HCS **`FlexibleIov`** slot
+/// with them so the guest gets a VPCI bus for the device — the slot's `EmulatorId`
+/// must equal [`HVFS_DEVICE_CLASS_ID`] (the HDV `DeviceClassId`) and the slot's
+/// map-key GUID must equal [`HVFS_DEVICE_INSTANCE_ID`] (the HDV `DeviceInstanceId`).
+/// Format them for the JSON document with [`guid_to_string`].
 ///
-/// `pub` so the consumer can declare the matching HCS **`FlexibleIov`** slot that
-/// gives the guest a VPCI bus: the slot's `EmulatorId` must equal
-/// [`SPIKE_CLASS_ID`] (the HDV `DeviceClassId`) and the slot's map-key GUID must
-/// equal [`SPIKE_INSTANCE_ID`] (the HDV `DeviceInstanceId`). Format them for the
-/// JSON document with [`guid_to_string`].
-pub const SPIKE_CLASS_ID: sys::GUID = sys::GUID {
+// TODO(caller-guids): these are baked-in today, so only one such device can exist
+// per guest and a consumer can't avoid a collision. The tracked follow-up
+// (README "Caller-supplied device GUIDs") is to let the host override them via
+// `device_json`, threading the ids through `attach`/`from_proxy`/`PciDevice::create`.
+pub const HVFS_DEVICE_CLASS_ID: sys::GUID = sys::GUID {
     Data1: 0xa7e1_1e40,
     Data2: 0x0001,
     Data3: 0x4a7e,
     Data4: [0x9c, 0x00, 0xa7, 0xe1, 0x00, 0x00, 0x00, 0x01],
 };
-pub const SPIKE_INSTANCE_ID: sys::GUID = sys::GUID {
+pub const HVFS_DEVICE_INSTANCE_ID: sys::GUID = sys::GUID {
     Data1: 0xa7e1_1e40,
     Data2: 0x0001,
     Data3: 0x4a7e,
@@ -47,7 +50,7 @@ pub const SPIKE_INSTANCE_ID: sys::GUID = sys::GUID {
 /// Device-**host** identity for the proxy path — the `ctx` argument of
 /// `HdvInitializeDeviceHostForProxy`, which (per disassembly) reads it as a 16-byte
 /// GUID and is **not** nullable. Distinct from the per-device class/instance ids.
-pub const SPIKE_HOST_ID: sys::GUID = sys::GUID {
+pub const HVFS_DEVICE_HOST_ID: sys::GUID = sys::GUID {
     Data1: 0xa7e1_1e40,
     Data2: 0x0001,
     Data3: 0x4a7e,
@@ -341,8 +344,8 @@ impl PciDevice {
             sys::HdvCreateDeviceInstance(
                 host.raw(),
                 sys::HDV_DEVICE_TYPE::Pci,
-                &SPIKE_CLASS_ID,
-                &SPIKE_INSTANCE_ID,
+                &HVFS_DEVICE_CLASS_ID,
+                &HVFS_DEVICE_INSTANCE_ID,
                 &(*ctx).vtable as *const sys::HDV_PCI_DEVICE_INTERFACE as *const c_void,
                 ctx as sys::PVOID,
                 &mut device,
