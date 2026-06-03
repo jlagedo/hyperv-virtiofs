@@ -73,6 +73,15 @@ The device **instance** id is already caller-chosen (`hvfs_add_share`'s `instanc
 callback in a global and route the device-host log stream to it. (Consider disclosing "not yet
 wired" in the header doc comment + regenerating until it lands, to stay honest like `ro`.)
 
+### End-to-end CI on a self-hosted Hyper-V runner
+The e2e ladder ([`testing.md`](testing.md)) is reproducible locally but doesn't run on hosted CI —
+GitHub `windows-latest` has no nested virtualization, so HCS/HDV can't create a VM. To gate merges on
+it, stand up a **self-hosted runner on a Hyper-V-capable Windows host**, stage (or build) the guest
+artifacts in a pre-step, and drive the same `test/run-e2e.ps1`. Until then the e2e tier is a manual,
+documented, on-demand check; only the build/lint/unit gates are automated.
+
+- Refs: [`testing.md`](testing.md), `.github/workflows/ci.yml`, `test/run-e2e.ps1`.
+
 ### Coherent guest memory (aperture eviction)
 The proof masks HDV aperture-cache staleness with a persistent mapping + interrupt re-arm + a
 4-attempt boot retry. For a fully coherent, zero-copy mapping, participate in HDV's aperture
@@ -85,6 +94,17 @@ The proof masks HDV aperture-cache staleness with a persistent mapping + interru
 ## shipped
 
 The verified record of what works. Each item is proven by tests and/or the design docs.
+
+- [x] **Concurrency / deployment model: one device host per process (Model A).** The DLL
+  registers a device host in the calling process; the supported deployment runs each VM's
+  device host in its own process (as WSL runs one `wsldevicehost` surrogate per device).
+  Driving *multiple* device hosts in *one* process is **out of scope** — the in-process
+  proxy path races in the closed platform (`from_proxy` → `E_ACCESSDENIED 0x80070005`, plus
+  an unverified teardown/IPC/aperture surface) on a configuration WSL never ships, so we
+  don't claim it. Proven by `hcs-testvm/tests/concurrent_processes.rs` (two hosts, two
+  processes, concurrent); rationale in [`share-abi.md`](share-abi.md#deployment-model--one-device-host-per-process-model-a).
+  This retires the earlier "caller-supplied host GUID for in-process coexistence" idea —
+  separate processes need no such thing.
 
 - [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and compiling on
   Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`, `lx`/`lxutil` FUSE backend).

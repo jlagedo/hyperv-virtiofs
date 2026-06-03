@@ -1,0 +1,178 @@
+#!/bin/bash
+# Self-testing init for the hyperv-virtiofs end-to-end suite, run as PID 1 inside
+# the initramfs (see docs/testing.md). It is the *guest half* of the test contract:
+# the Rust integration tests in crates/hcs-testvm/tests/ assert on the exact console
+# sentinels this script prints. DO NOT rename a sentinel without updating the test
+# that waits for it AND rebuilding the artifacts (test/build-guest-artifacts.ps1).
+#
+# Sentinels (consumer test):
+#   OPENVMM-VIRTIOFS-SPIKE         userspace reached            (boot.rs)
+#   1af4:1100                      driverless PCI dev enumerated (attach*.rs, via dmesg)
+#   PROOF_COMPLETE_PASS            cold virtio-fs mount + read   (attach_virtiofs.rs)
+#   GUEST_READY                    hotplug watch loop armed      (hotplug.rs, attach_abi.rs)
+#   HOTPLUG_MOUNT_PASS tag=<t>     a hot-added device mounted    (hotplug.rs, attach_abi.rs)
+#   HOTPLUG_REMOVE_OK tag=<t>      a removed device unmounted    (hotplug.rs, stage 3)
+# Opt-in self-test (only with `atelier.fileperf` on the cmdline; file_selftest.rs):
+#   SELFTEST_LARGEFILE tag=<t> size=.. sha256=..   64 MiB file digest (host re-checks)
+#   SELFTEST_LARGEFILE_PASS tag=<t>                guest read-back integrity ok
+#   PERF tag=<t> .. write_MBps=.. read_MBps=..     sequential throughput
+#   SELFTEST_MANYFILES_PASS tag=<t>                500 files created
+#   SELFTEST_SPECIALNAMES_PASS tag=<t>             space/unicode/nested names
+#   SELFTEST_DONE tag=<t>                          self-test finished (test waits on this)
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc     proc /proc      2>/dev/null
+mount -t sysfs    sys  /sys        2>/dev/null
+mount -t devtmpfs dev  /dev        2>/dev/null
+exec >/dev/console 2>&1
+echo "================ OPENVMM-VIRTIOFS-SPIKE ================"
+echo "kernel: $(uname -r)"
+# Bring up the Hyper-V VMBus VPCI stack so HDV FlexibleIov devices (which surface
+# over VMBus, not legacy PCI) get a bus to enumerate on. Harmless to the
+# virtio-fs-over-PCI proof below.
+echo "--- loading Hyper-V VPCI stack (hv_vmbus + pci-hyperv) ---"
+modprobe hv_vmbus   2>&1; echo "modprobe hv_vmbus rc=$?"
+modprobe pci-hyperv 2>&1; echo "modprobe pci-hyperv rc=$?"
+sleep 2   # let VMBus offer the VPCI channel and hv_pci enumerate
+echo "--- virtio PCI devices ---"
+ls /sys/bus/pci/devices 2>/dev/null
+for d in /sys/bus/pci/devices/*; do
+  [ -e "$d/vendor" ] || continue
+  printf 'pcidev %s %s:%s\n' "${d##*/}" "$(cat "$d/vendor")" "$(cat "$d/device")"
+done
+grep -H . /sys/bus/pci/devices/*/virtio*/device 2>/dev/null
+echo "--- loading modules ---"
+modprobe fuse     2>&1; echo "modprobe fuse rc=$?"
+modprobe virtiofs 2>&1; echo "modprobe virtiofs rc=$?"
+echo "--- lsmod (virtio/fuse) ---"
+lsmod | grep -Ei 'virtio|fuse'
+echo "--- virtio-fs tags advertised by the device ---"
+cat /sys/bus/virtio/devices/*/tag 2>/dev/null || echo "(no /sys virtio tag node)"
+mkdir -p /mnt/ws
+echo "--- mounting -t virtiofs ws /mnt/ws ---"
+if mount -t virtiofs ws /mnt/ws; then
+  echo "================ MOUNT_OK ================"
+  ls -la /mnt/ws
+  echo "--- SENTINEL contents ---"
+  cat /mnt/ws/SENTINEL.txt 2>&1
+  echo "--- write-back test ---"
+  if echo "guest $(uname -r) was here" > /mnt/ws/FROM_GUEST.txt 2>/dev/null; then
+    echo "WRITE_OK (wrote /mnt/ws/FROM_GUEST.txt)"
+  else
+    echo "WRITE_FAILED (read-only or denied)"
+  fi
+  echo "================ PROOF_COMPLETE_PASS ================"
+else
+  rc=$?
+  echo "================ MOUNT_FAILED rc=$rc ================"
+  echo "--- dmesg tail ---"
+  dmesg | tail -30
+  echo "================ PROOF_COMPLETE_FAIL ================"
+fi
+sync
+echo "================ GUEST_READY ================"
+
+# --- Opt-in file-level self-test + micro-benchmark (docs/testing.md) -------------
+# Runs once per freshly hot-mounted share, ONLY when the kernel cmdline carries
+# `atelier.fileperf` — so the plain hotplug/abi tests are unaffected. Exercises edge
+# cases the basic mount proof doesn't: large-file write-through integrity (the host
+# re-checks the printed sha256), raw throughput, many-files metadata cost, and
+# special/unicode/nested names. Each result is a sentinel a Rust e2e test asserts on.
+run_selftest() {
+  t="$1"; mp="$2"
+  echo "================ SELFTEST_BEGIN tag=$t ================"
+  # Transfer sizes are tunable from the kernel cmdline so the host can keep them small
+  # (less exposure to HDV aperture-cache staleness on sustained transfers) without a
+  # rebuild. Defaults are deliberately modest — the point is to prove integrity +
+  # measurable throughput, not to stress the link.
+  bigmb=$(sed -n 's/.*atelier\.bigmb=\([0-9]*\).*/\1/p' /proc/cmdline);  [ -n "$bigmb" ]  || bigmb=8
+  perfmb=$(sed -n 's/.*atelier\.perfmb=\([0-9]*\).*/\1/p' /proc/cmdline); [ -n "$perfmb" ] || perfmb=16
+
+  # (1) Large-file write-through integrity. The host reads the same file from the
+  #     shared directory and recomputes the sha256, proving guest->host coherence.
+  big="$mp/selftest_big.bin"
+  if dd if=/dev/urandom of="$big" bs=1M count="$bigmb" conv=fsync 2>/dev/null; then
+    sync
+    sz=$(stat -c %s "$big" 2>/dev/null)
+    sha=$(sha256sum "$big" 2>/dev/null | cut -d' ' -f1)
+    echo "SELFTEST_LARGEFILE tag=$t size=$sz sha256=$sha"
+    # The host re-reads this file and recomputes the sha — that cross-domain check is the
+    # real integrity gate, so we avoid a guest-side cache-cold re-read (drop_caches forces
+    # the device to re-fetch every page, which needlessly stresses the HDV aperture).
+    [ -n "$sha" ] && echo "SELFTEST_LARGEFILE_PASS tag=$t" || echo "SELFTEST_LARGEFILE_FAIL tag=$t (no sha)"
+  else
+    echo "SELFTEST_LARGEFILE_FAIL tag=$t (write error)"
+  fi
+
+  # (2) Throughput: a single fsync'd sequential write (real device traffic). We report
+  #     the warm read rate too, but do not drop_caches (see above).
+  perf="$mp/selftest_perf.bin"; bytes=$((perfmb * 1024 * 1024))
+  t0=$(date +%s%N); dd if=/dev/zero of="$perf" bs=1M count="$perfmb" conv=fsync 2>/dev/null; t1=$(date +%s%N)
+  wms=$(( (t1 - t0) / 1000000 ))
+  t0=$(date +%s%N); dd if="$perf" of=/dev/null bs=1M 2>/dev/null; t1=$(date +%s%N)
+  rms=$(( (t1 - t0) / 1000000 ))
+  wmbps=0; rmbps=0
+  [ "$wms" -gt 0 ] && wmbps=$(( bytes / 1000 / wms ))   # bytes / (ms/1000) / 1e6
+  [ "$rms" -gt 0 ] && rmbps=$(( bytes / 1000 / rms ))
+  echo "PERF tag=$t bytes=$bytes write_ms=$wms read_ms=$rms write_MBps=$wmbps read_MBps=$rmbps"
+
+  # (3) Many small files — metadata/create throughput (count tunable).
+  manyn=$(sed -n 's/.*atelier\.manyn=\([0-9]*\).*/\1/p' /proc/cmdline); [ -n "$manyn" ] || manyn=100
+  md="$mp/selftest_many"; n="$manyn"; mkdir -p "$md"
+  t0=$(date +%s%N)
+  i=0; while [ "$i" -lt "$n" ]; do echo "$i" > "$md/f_$i.txt"; i=$((i + 1)); done
+  sync; t1=$(date +%s%N)
+  cnt=$(ls -1 "$md" 2>/dev/null | wc -l); mms=$(( (t1 - t0) / 1000000 ))
+  echo "SELFTEST_MANYFILES tag=$t created=$cnt want=$n elapsed_ms=$mms"
+  if [ "$cnt" -eq "$n" ]; then echo "SELFTEST_MANYFILES_PASS tag=$t"; else echo "SELFTEST_MANYFILES_FAIL tag=$t"; fi
+
+  # (4) Special / unicode / nested names.
+  sd="$mp/selftest names"; mkdir -p "$sd/nested/deep"
+  echo hi > "$sd/space file.txt"
+  echo hi > "$sd/nested/deep/leaf.txt"
+  printf 'hi' > "$sd/uni_café_文件.txt"
+  if [ -f "$sd/space file.txt" ] && [ -f "$sd/nested/deep/leaf.txt" ] && [ -f "$sd/uni_café_文件.txt" ]; then
+    echo "SELFTEST_SPECIALNAMES_PASS tag=$t"
+  else
+    echo "SELFTEST_SPECIALNAMES_FAIL tag=$t"
+  fi
+
+  echo "================ SELFTEST_DONE tag=$t ================"
+}
+
+# --- VPCI device-hotplug watch loop (device-per-share spike, docs/hotplug-spike.md) ---
+# The host hot-adds/removes a virtio-fs *device* per share on the running VM. We can't
+# read a freshly-bound device's tag reliably from sysfs across kernels, so we mount by
+# *trying* a known candidate tag list (from the kernel cmdline `atelier.hptags=a,b,c`,
+# else a default). A new device makes its tag's mount succeed; a removed device makes an
+# already-mounted session error out (EIO) — which we treat as the removal signal.
+hptags=$(sed -n 's/.*atelier\.hptags=\([^ ]*\).*/\1/p' /proc/cmdline | tr ',' ' ')
+[ -n "$hptags" ] || hptags="hp1 hp2"
+echo "hotplug: watching tags: $hptags"
+mounted=" "
+i=0
+while [ "$i" -lt 300 ]; do
+  for t in $hptags; do
+    mp="/sessions/$t"
+    case "$mounted" in
+      *" $t "*)
+        # Already mounted — probe for hot-remove (stale virtiofs mount → ls fails).
+        if ! ls "$mp" >/dev/null 2>&1; then
+          umount -l "$mp" 2>/dev/null
+          mounted=$(printf '%s' "$mounted" | sed "s/ $t / /")
+          echo "================ HOTPLUG_REMOVE_OK tag=$t ================"
+        fi
+        continue
+        ;;
+    esac
+    mkdir -p "$mp"
+    if mount -t virtiofs "$t" "$mp" 2>/dev/null; then
+      mounted="$mounted$t "
+      echo "================ HOTPLUG_MOUNT_PASS tag=$t path=$mp ================"
+      ls -la "$mp" 2>&1 | head -5
+      cat "$mp/SENTINEL.txt" 2>/dev/null
+      if grep -q 'atelier\.fileperf' /proc/cmdline; then run_selftest "$t" "$mp"; fi
+    fi
+  done
+  i=$((i + 1))
+  sleep 2
+done

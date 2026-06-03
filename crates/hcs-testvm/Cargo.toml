@@ -18,12 +18,16 @@ hdv = { path = "../hdv" }
 # The virtio-fs-over-HDV attach spike (`tests/attach_virtiofs.rs`) drives the real
 # OpenVMM transport instead of the trivial SpikeDevice.
 virtio-hdv = { path = "../virtio-hdv" }
+# The shipped C ABI (hvfs_host_open / hvfs_add_share / …), driven end-to-end by
+# `tests/attach_abi.rs` and exercised one-host-per-process by the `host_child` binary
+# (`src/bin/host_child.rs`) the `concurrent_processes` test spawns. A normal (not dev)
+# dependency so that `src/bin` target can use it — `src/bin` can't see dev-deps.
+hyperv_virtiofs = { path = "../hyperv_virtiofs" }
 
 [dev-dependencies]
-# `tests/attach_abi.rs` drives the cdylib's exported C ABI (hvfs_host_open /
-# hvfs_add_share / hvfs_remove_share / hvfs_host_close) end-to-end — links it
-# in-process via its rlib output.
-hyperv_virtiofs = { path = "../hyperv_virtiofs" }
+# `tests/file_selftest.rs` recomputes the sha256 of a large file the guest wrote
+# through virtio-fs, to verify guest->host write-through coherence.
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

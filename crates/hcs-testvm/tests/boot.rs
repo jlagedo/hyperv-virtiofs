@@ -3,9 +3,9 @@
 //! and the Rocky artifacts — not available on CI runners.
 //!
 //! Run it explicitly:
-//!   $env:HVFS_KERNEL="E:\dev\spike\out\vmlinuz"
-//!   $env:HVFS_INITRD="E:\dev\spike\out\initramfs.cpio.gz"
+//!   .\test\build-guest-artifacts.ps1   # one-time: build test\guest\out artifacts
 //!   cargo test -p hcs-testvm --test boot -- --ignored --nocapture
+//! (Override artifact paths with $env:HVFS_KERNEL / $env:HVFS_INITRD; see docs/testing.md.)
 #![cfg(windows)]
 
 use hcs_testvm::{RockyConfig, RockyVm};
@@ -14,10 +14,7 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
 fn boots_rocky_under_hcs() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
+    let (kernel, initrd) = hcs_testvm::artifact_paths();
     assert!(
         std::path::Path::new(&kernel).exists(),
         "kernel not found: {kernel}"

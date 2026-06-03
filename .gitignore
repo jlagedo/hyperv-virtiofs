@@ -1,4 +1,7 @@
 /target
 /dist
 **/*.gen.h
+# Built guest artifacts for the e2e suite (multi-hundred-MB; rebuild with
+# test/build-guest-artifacts.ps1). The init self-test + build script are committed.
+/test/guest/out/
 # Cargo.lock IS committed — this workspace ships a binary (cdylib) product.

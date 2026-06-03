@@ -41,22 +41,48 @@ cbindgen --config cbindgen.toml --crate hyperv_virtiofs --output include/hyperv_
 ### Integration tests (live VM — gated)
 
 All tests in `crates/hcs-testvm/tests/` are `#[ignore]` because they need a Hyper-V host
-and Rocky Linux kernel/initramfs artifacts (not on CI). Run one explicitly with env vars
-pointing at the guest artifacts:
+and Rocky Linux kernel/initramfs artifacts (not on CI). The whole e2e tier — prerequisites,
+the ladder, the guest↔test sentinel contract, and troubleshooting — is documented in
+**`docs/testing.md`**; the reproducible tooling lives in **`test/`**:
 
 ```pwsh
-$env:HVFS_KERNEL="E:\dev\spike\out\vmlinuz"
-$env:HVFS_INITRD="E:\dev\spike\out\initramfs.cpio.gz"
-cargo test -p hcs-testvm --test attach_abi -- --ignored --nocapture
+.\test\build-guest-artifacts.ps1   # once: build test\guest\out\ (Rocky kernel + initramfs, via WSL+Docker)
+.\test\run-e2e.ps1                 # run the ladder, print a PASS/FAIL summary
+.\test\run-e2e.ps1 -Test attach_abi   # or one rung
 ```
+
+Artifact paths resolve via `hcs_testvm::artifact_paths()`: `HVFS_KERNEL` / `HVFS_INITRD`
+override, else the in-repo `test/guest/out/` default — so a plain
+`cargo test -p hcs-testvm --test attach_abi -- --ignored --nocapture` works after a build,
+no env vars needed. The artifacts are git-ignored (built, not committed); the two inputs
+that define them — `test/guest/build-rocky-initramfs.sh` and the guest `test/guest/init`
+self-test — are committed.
+
+**The guest `init` and the Rust tests are coupled by exact console sentinels** (e.g.
+`PROOF_COMPLETE_PASS`, `GUEST_READY`, `HOTPLUG_MOUNT_PASS tag=…`). Changing a sentinel
+means updating the consuming test *and* rebuilding the artifacts — see the contract table
+in `docs/testing.md`.
 
 Test ladder (each proves one more layer; `docs/` has the design notes):
 - `boot.rs` — Rocky boots under HCS, reaches userspace (validates the rig).
 - `attach_proxy.rs` — the `ExternalRestricted` FlexibleIov proxy handshake (`docs/hdv-proxy-abi.md`).
-- `attach_oop.rs` — the in-process-vs-child-process experiment that established the proxy model is required.
 - `attach_virtiofs.rs` — the real `VirtioHdvDevice` transport: guest **mounts** and reads a file (device attached *before* start).
 - `hotplug.rs` — hot-add a device-per-share to an *already-running* VM (`docs/hotplug-spike.md`).
 - `attach_abi.rs` — the shipped front door: drives the exported C functions end-to-end (the authoritative ABI proof).
+- `edge_cases.rs` — the C ABI rejects bad share input (`ro`/GUID/JSON/null) against a *live* host; needs only a created (not started) VM, so it's fast.
+- `file_selftest.rs` — **best-effort** (not in the green ladder; `run-e2e.ps1 -IncludeBestEffort`): file-level edge cases + throughput over virtio-fs — multi-MiB write-through integrity (host recomputes the guest's sha256), MB/s, many-files, unicode/nested names, via the guest's opt-in `atelier.fileperf` self-test in `test/guest/init`. Sustained I/O is gated by the aperture-coherence limitation (`docs/testing.md`), so it isn't a hard gate.
+- `concurrent_processes.rs` — **Model A** proof: two `host_child` processes, each its own device host + VM, hot-add a share and mount concurrently. The supported deployment is **one device host per process** (see `docs/share-abi.md`); driving multiple hosts in one process is out of scope (the in-process proxy path races — `from_proxy` → `0x80070005`).
+- `attach.rs` / `attach_oop.rs` — **negative spikes**: they assert success and so *fail by
+  design* on current Windows, standing as reproductions of why the proxy path is required.
+  Excluded from `run-e2e.ps1` unless `-IncludeNegativeSpikes`.
+- `diag_cold_multidevice.rs` — standalone **diagnostic** (passes): asserts two *custom*-class
+  cold devices are rejected at power-on (`0xC0350005`), i.e. why the well-known class id is
+  required. Not in the green ladder.
+
+Offline **unit tests** (run on CI via `cargo test --workspace`) cover the ABI's
+deterministic surface — `hyperv_virtiofs` (`src/lib.rs` `mod tests`: panic guard, null/arg
+contracts, `host_json`/`share_json` parsing, request shaping) and `hdv::pci` GUID
+parse/format round-trips.
 
 These tests retry attach+boot a few times on purpose: HDV guest-memory apertures are an
 evictable cache, so a fraction of boots stall — each retry is a fresh VM.
@@ -121,6 +147,13 @@ machinery, and FUSE server are **reused** (pinned git deps), not reimplemented.
   relies on a persistent aperture + interrupt re-arm + boot retry to mask aperture-cache
   staleness.
 - `hvfs_set_logger` is a no-op stub today.
+- **One device host per process (Model A).** The DLL registers a device host in the calling
+  process; the supported deployment runs each VM's device host in its own process (as WSL
+  does). Registering multiple device hosts in one process is unsupported — the in-process
+  proxy registration races the closed platform (`HdvInitializeDeviceHostForProxy` →
+  `E_ACCESSDENIED 0x80070005`), and we deliberately don't lock around it (it would imply a
+  multi-host-per-process safety the platform's teardown/IPC/aperture paths don't give us).
+  See `docs/share-abi.md` ("Deployment model").
 
 Open work (live removal, `ro` enforcement, caller-supplied GUIDs, logger wiring, coherent
 guest memory) is tracked in `docs/roadmap.md`.

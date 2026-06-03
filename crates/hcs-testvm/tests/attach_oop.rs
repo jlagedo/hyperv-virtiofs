@@ -22,9 +22,9 @@
 //! §7 #3 / task #16. Next forensic target: how `wslservice`/`wsldevicehost` register.
 //!
 //! `#[ignore]` — needs a Hyper-V-capable host + the Rocky artifacts. Run it:
-//!   $env:HVFS_KERNEL="E:\dev\spike\out\vmlinuz"
-//!   $env:HVFS_INITRD="E:\dev\spike\out\initramfs.cpio.gz"
+//!   .\test\build-guest-artifacts.ps1   # one-time: build test\guest\out artifacts
 //!   cargo test -p hcs-testvm --test attach_oop -- --ignored --nocapture
+//! (Override artifact paths with $env:HVFS_KERNEL / $env:HVFS_INITRD; see docs/testing.md.)
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
@@ -36,10 +36,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
 fn attaches_hdv_pci_device_out_of_process() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
+    let (kernel, initrd) = hcs_testvm::artifact_paths();
     assert!(
         std::path::Path::new(&kernel).exists(),
         "kernel not found: {kernel}"

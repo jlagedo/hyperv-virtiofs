@@ -101,8 +101,17 @@ impl DeviceHost {
         device_host_support: sys::PVOID,
     ) -> Result<Self> {
         let mut handle: sys::HDV_HOST = std::ptr::null_mut();
-        // SAFETY: caller guarantees a valid GUID + IVmDeviceHostSupport; `handle` is
-        // a valid out ptr.
+        // NOTE: the in-process proxy registration path is **not** concurrency-safe —
+        // two overlapping `HdvInitializeDeviceHostForProxy` calls in one process race in
+        // the closed platform machinery (one returns `E_ACCESSDENIED 0x80070005`), and
+        // that is only the first such hazard (teardown/IPC/aperture paths are equally
+        // unverified for multi-host-per-process, a configuration WSL never ships). The
+        // supported deployment is therefore **one device host per process** — register a
+        // host, then run that host's work in its own process, as WSL does. We deliberately
+        // do not paper over it with a lock, which would imply a multi-host-per-process
+        // safety we cannot vouch for. See docs/share-abi.md ("Deployment model").
+        // SAFETY: caller guarantees a valid GUID + IVmDeviceHostSupport; `handle` is a
+        // valid out ptr.
         hr(unsafe {
             sys::HdvInitializeDeviceHostForProxy(
                 device_host_id as sys::PVOID,

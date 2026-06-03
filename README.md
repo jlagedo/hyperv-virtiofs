@@ -180,6 +180,23 @@ header drifts** from the Rust source. Tagged `v*` pushes publish a GitHub releas
 carrying `hyperv_virtiofs.{dll,dll.lib,pdb}` + the header — the bundle a consumer
 **pins** (it does not build this from source).
 
+## Testing
+
+Two tiers. The **unit / build gates** (`cargo test --workspace`, clippy, fmt,
+header-freshness) run on CI. The **end-to-end suite** boots a real Rocky Linux 10 guest
+under Hyper-V and drives the stack up a ladder — *rig boot → proxy transport → cold
+virtio-fs mount → live hot-add → the shipped C ABI* — proving a stock EL10 kernel mounts a
+host directory over our bridge with no 9p and no guest changes. It's `#[ignore]`d (needs a
+Hyper-V host + guest artifacts, so not on hosted CI) and reproducible from a clone:
+
+```pwsh
+.\test\build-guest-artifacts.ps1   # once: build the guest kernel + initramfs (Docker via WSL)
+.\test\run-e2e.ps1                 # run the ladder, print a PASS/FAIL summary
+```
+
+Full guide — prerequisites, the test ladder, the guest↔test sentinel contract, and
+troubleshooting — is in [`docs/testing.md`](docs/testing.md).
+
 ## Roadmap
 
 What's **shipped** and what's still **open** — live share removal (platform-blocked), `ro`

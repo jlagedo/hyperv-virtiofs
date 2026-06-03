@@ -27,6 +27,32 @@ const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Resolve the guest **kernel** (`vmlinuz`) and **initrd** (`initramfs.cpio.gz`)
+/// artifact paths for the integration tests.
+///
+/// The `HVFS_KERNEL` / `HVFS_INITRD` environment variables override; otherwise both
+/// default to the in-repo build output at `test/guest/out/`, produced by
+/// `test/build-guest-artifacts.ps1` (see `docs/testing.md`). This keeps the test
+/// ladder reproducible on any clone — no machine-specific paths baked into the
+/// sources.
+///
+/// Returns `(kernel_path, initrd_path)`. Existence is **not** checked here; each
+/// test asserts it so the failure message names the missing file.
+pub fn artifact_paths() -> (String, String) {
+    // CARGO_MANIFEST_DIR is `<repo>/crates/hcs-testvm` at compile time.
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("test")
+        .join("guest")
+        .join("out");
+    let kernel = std::env::var("HVFS_KERNEL")
+        .unwrap_or_else(|_| out.join("vmlinuz").to_string_lossy().into_owned());
+    let initrd = std::env::var("HVFS_INITRD")
+        .unwrap_or_else(|_| out.join("initramfs.cpio.gz").to_string_lossy().into_owned());
+    (kernel, initrd)
+}
+
 /// An HCS `FlexibleIov` device slot. Declaring one gives the Linux guest a VPCI
 /// bus over VMBus (enumerated by `pci-hyperv`) onto which an in-process HDV device
 /// surfaces. The GUIDs must match the HDV device: `instance_guid` is the slot's

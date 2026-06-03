@@ -41,6 +41,45 @@ adapter), not the DLL's.
 5. **The device host registers before start.** `from_proxy` is done at VM bringup (as WSL does);
    shares are added after the guest is up.
 
+## Deployment model — one device host per process (Model A)
+
+`hyperv_virtiofs.dll` is a **library**, not a service: it registers a device host **in
+whatever process loads it** and never spawns anything. The **supported deployment is one
+device host per process** — a host daemon runs each VM's device host in its own worker
+process (the worker `HcsOpenComputeSystem`s the daemon's system by id, then calls
+`hvfs_host_open` once). This is exactly how WSL ships it: one `wsldevicehost` surrogate per
+device. The DLL does **not** implement the spawning/surrogate — process topology is the
+host's job.
+
+Why this is the contract, not just a suggestion:
+
+1. **The in-process proxy path is not concurrency-safe, and we can't fully verify it.**
+   Two overlapping `HdvInitializeDeviceHostForProxy` calls in **one process** race in the
+   closed platform machinery and one returns `E_ACCESSDENIED` (`0x80070005`). That is only
+   the *first* such hazard — a concurrent teardown also faulted in testing, and the
+   per-host IPC/guest-memory-aperture paths are equally unexercised for
+   multiple-device-hosts-in-one-process, a configuration the platform author (WSL) never
+   ships. Patching the one race we tripped over (a process-wide lock) would imply a safety
+   we cannot stand behind. One host per process makes the entire question moot: each
+   process runs exactly the configuration the platform is built and tested for.
+2. **Fault / security isolation.** The device host parses **untrusted guest input** (virtio
+   queues, FUSE requests). Per-process isolation bounds a crash or a guest-triggered
+   exploit to a single VM's worker (which can be sandboxed with a restricted token), instead
+   of taking down a daemon shared by every VM. This is why WSL sandboxes its device host in
+   a `dllhost` surrogate.
+
+Consequences for the ABI surface:
+
+- Within its own process a host is fully usable from multiple threads (handles are `Send`,
+  errors are thread-local — read `hvfs_last_error` on the same OS thread as the failing
+  call; a Go consumer should `runtime.LockOSThread` around a call→error sequence).
+- Driving **multiple** device hosts concurrently **in one process** is **out of scope** and
+  not made safe — use one process each.
+- Verified by `crates/hcs-testvm/tests/concurrent_processes.rs`: two device hosts in
+  separate processes register and mount their shares concurrently. See also
+  `hdv::DeviceHost::from_proxy` (which documents the in-process hazard and the deliberate
+  absence of a lock).
+
 ## Object model
 
 ```

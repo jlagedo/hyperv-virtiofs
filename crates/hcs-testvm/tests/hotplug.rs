@@ -21,7 +21,7 @@
 //!   2. `vm.modify()` — `HcsModifyComputeSystem` **Add** the `FlexibleIov` slot,
 //!      whose `DeviceInstanceId` resolves to the just-created device.
 //!
-//! The guest's hotplug-watch loop (`E:\dev\spike\init`) mounts the tag and prints
+//! The guest's hotplug-watch loop (`test/guest/init`) mounts the tag and prints
 //! `HOTPLUG_MOUNT_PASS tag=hp1`.
 //!
 //! The `attach_proxy.rs` note that runtime hot-add "raced the fast-exiting
@@ -32,12 +32,12 @@
 //! stale descriptor read and stall. Each attempt is a fresh VM.
 //!
 //! `#[ignore]` — needs Hyper-V + the Rocky artifacts. Run it:
-//!   $env:HVFS_KERNEL="E:\dev\spike\out\vmlinuz"
-//!   $env:HVFS_INITRD="E:\dev\spike\out\initramfs.cpio.gz"
+//!   .\test\build-guest-artifacts.ps1   # one-time: build test\guest\out artifacts
 //!   cargo test -p hcs-testvm --test hotplug -- --ignored --nocapture
+//! (Override artifact paths with $env:HVFS_KERNEL / $env:HVFS_INITRD; see docs/testing.md.)
 #![cfg(windows)]
 
-use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
+use hcs_testvm::{RockyConfig, RockyVm};
 use hdv::pci::{
     guid_to_string, HVFS_DEVICE_CLASS_ID, HVFS_DEVICE_HOST_ID, HVFS_DEVICE_INSTANCE_ID,
 };
@@ -104,10 +104,7 @@ fn add_slot_request(instance_id: &str, emulator_id: &str) -> String {
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
 fn guest_hot_mounts_added_device() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
+    let (kernel, initrd) = hcs_testvm::artifact_paths();
     assert!(
         std::path::Path::new(&kernel).exists(),
         "kernel not found: {kernel}"
@@ -226,10 +223,7 @@ fn remove_slot_request(instance_id: &str, emulator_id: &str) -> String {
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
 fn guest_hot_mounts_two_devices_concurrently() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
+    let (kernel, initrd) = hcs_testvm::artifact_paths();
     assert!(
         std::path::Path::new(&kernel).exists(),
         "kernel not found: {kernel}"
@@ -352,97 +346,7 @@ fn try_two_then_remove(
     true // pass criterion: both devices mounted concurrently
 }
 
-// ============== Diagnostic — two devices declared COLD ==============
-//
-// Stage 2's runtime path hit ERROR_HV_INVALID_PARAMETER (0xC0350005) adding a
-// *second* FlexibleIov slot at runtime — even with a distinct class id. This test
-// answers the prerequisite question: can two FlexibleIov devices coexist on one VM
-// *at all*, if both slots are declared **cold** (in the create document) and both
-// devices created **before** start? If yes, multi-share via device-per-share is
-// viable (atelier would pre-declare a slot pool); if no, FlexibleIov is 1-device.
-
-#[test]
-#[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
-fn two_devices_cold_declared() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
-    assert!(
-        std::path::Path::new(&kernel).exists(),
-        "kernel not found: {kernel}"
-    );
-    assert!(
-        std::path::Path::new(&initrd).exists(),
-        "initrd not found: {initrd}"
-    );
-
-    let ws1 = make_workspace("hp1");
-    let ws2 = make_workspace("hp2");
-
-    const ATTEMPTS: usize = 4;
-    for attempt in 1..=ATTEMPTS {
-        eprintln!("--- attempt {attempt}/{ATTEMPTS} ---");
-        if try_two_cold(&kernel, &initrd, &ws1, &ws2) {
-            eprintln!("PASS on attempt {attempt}");
-            return;
-        }
-    }
-    panic!("two cold-declared devices did not both mount in {ATTEMPTS} attempts");
-}
-
-/// One attempt: declare two FlexibleIov slots cold, create both devices on the
-/// shared host before start, boot, and require both to mount.
-fn try_two_cold(kernel: &str, initrd: &str, ws1: &std::path::Path, ws2: &std::path::Path) -> bool {
-    let class1 = HVFS_DEVICE_CLASS_ID;
-    let instance1 = HVFS_DEVICE_INSTANCE_ID;
-    let mut class2 = HVFS_DEVICE_CLASS_ID;
-    class2.Data4[7] = 0x12;
-    let mut instance2 = HVFS_DEVICE_INSTANCE_ID;
-    instance2.Data4[7] = 0x22;
-
-    // Both slots declared cold in the create document.
-    let mut cfg = RockyConfig::new(kernel, initrd)
-        .with_flexible_iov(FlexibleIovSlot::new(
-            guid_to_string(&instance1),
-            guid_to_string(&class1),
-        ))
-        .with_flexible_iov(FlexibleIovSlot::new(
-            guid_to_string(&instance2),
-            guid_to_string(&class2),
-        ));
-    cfg.kernel_cmdline = "console=ttyS0 atelier.hptags=hp1,hp2".into();
-
-    let vm = RockyVm::create(&cfg).expect("create Rocky compute system");
-    eprintln!("compute system id: {}", vm.id());
-
-    // One shared device host; both devices created BEFORE start so the cold slots
-    // resolve at the start reservation.
-    // SAFETY: the VM outlives `support` and both devices.
-    let support = unsafe { DeviceHostSupport::new(vm.system_handle()) };
-    let host = Arc::new(
-        unsafe { DeviceHost::from_proxy(&HVFS_DEVICE_HOST_ID, support.as_iunknown()) }
-            .unwrap_or_else(|e| panic!("from_proxy (shared host) failed: {e}")),
-    );
-    let guest_mem = cfg.memory_mb as u64 * 1024 * 1024;
-    let device1 =
-        VirtioHdvDevice::attach_shared(host.clone(), ws1, "hp1", guest_mem, &class1, &instance1)
-            .expect("attach device #1");
-    let device2 =
-        VirtioHdvDevice::attach_shared(host.clone(), ws2, "hp2", guest_mem, &class2, &instance2)
-            .expect("attach device #2");
-
-    vm.start().expect("start Rocky compute system");
-
-    let p1 = vm.wait_for_console("HOTPLUG_MOUNT_PASS tag=hp1", Duration::from_secs(45));
-    let p2 = vm.wait_for_console("HOTPLUG_MOUNT_PASS tag=hp2", Duration::from_secs(45));
-    if !(p1 && p2) {
-        eprintln!(
-            "===== two-cold console (hp1={p1} hp2={p2}) =====\n{}\n===================",
-            vm.console()
-        );
-    }
-
-    let _ = (&support, &device1, &device2, &host);
-    p1 && p2
-}
+// NOTE: the "two devices declared COLD" diagnostic moved to
+// `tests/diag_cold_multidevice.rs` — it exercises a *custom*-class limitation
+// (rejected at power-on), not the shipped well-known-class path, so it lives apart
+// from this green ladder.

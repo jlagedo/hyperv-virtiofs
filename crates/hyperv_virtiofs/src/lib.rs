@@ -580,3 +580,227 @@ pub unsafe extern "C" fn hvfs_set_logger(cb: hvfs_log_fn, ctx: *mut c_void) {
     // No-op stub today; tracked in docs/roadmap.md ("Wire hvfs_set_logger").
     let _ = (cb, ctx);
 }
+
+#[cfg(test)]
+mod tests {
+    //! Offline unit tests for the C ABI's deterministic surface — argument
+    //! validation, JSON contracts, request shaping, and the panic guard. None of
+    //! these touch HCS/HDV, so they run on any host (including CI). The live
+    //! device paths are proven by the gated e2e ladder (`docs/testing.md`).
+    use super::*;
+
+    // ---- version + status codes -------------------------------------------------
+
+    #[test]
+    fn abi_version_is_two() {
+        assert_eq!(hvfs_abi_version(), 2);
+        assert_eq!(hvfs_abi_version(), HVFS_ABI_VERSION);
+    }
+
+    #[test]
+    fn status_codes_are_distinct_and_signed() {
+        let codes = [
+            HVFS_OK,
+            HVFS_ERR_INVALID_ARG,
+            HVFS_ERR_NOT_IMPLEMENTED,
+            HVFS_ERR_PANIC,
+            HVFS_ERR_HDV,
+            HVFS_ERR_UNSUPPORTED,
+        ];
+        // All errors are negative; OK is the only zero; none collide.
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "status codes must be distinct");
+            }
+        }
+        assert_eq!(HVFS_OK, 0);
+        assert!(codes[1..].iter().all(|c| *c < 0), "errors must be < 0");
+    }
+
+    // ---- guard(): no panic crosses the boundary ---------------------------------
+
+    #[test]
+    fn guard_passes_through_normal_return() {
+        assert_eq!(guard(|| HVFS_OK), HVFS_OK);
+        assert_eq!(guard(|| HVFS_ERR_HDV), HVFS_ERR_HDV);
+    }
+
+    #[test]
+    fn guard_converts_panic_to_panic_code() {
+        // Silence the default panic backtrace for this one deliberate panic.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let code = guard(|| panic!("boom across FFI"));
+        std::panic::set_hook(prev);
+        assert_eq!(code, HVFS_ERR_PANIC);
+        // The guard records a diagnostic for hvfs_last_error.
+        let msg = LAST_ERROR.with(|e| e.borrow().clone());
+        assert!(msg.is_some(), "panic should set a thread-local last_error");
+    }
+
+    // ---- cstr(): borrow + validate C string args --------------------------------
+
+    #[test]
+    fn cstr_rejects_null() {
+        assert_eq!(cstr(ptr::null(), "x"), Err(HVFS_ERR_INVALID_ARG));
+    }
+
+    #[test]
+    fn cstr_accepts_valid_utf8() {
+        let c = CString::new("hello").unwrap();
+        assert_eq!(cstr(c.as_ptr(), "x"), Ok("hello"));
+    }
+
+    #[test]
+    fn cstr_rejects_non_utf8() {
+        // 0xFF is never valid UTF-8; CString allows it (no interior NUL).
+        let c = CString::new(vec![0xFFu8, 0xFE]).unwrap();
+        assert_eq!(cstr(c.as_ptr(), "x"), Err(HVFS_ERR_INVALID_ARG));
+    }
+
+    // ---- host_json / share_json contracts ---------------------------------------
+
+    #[test]
+    fn host_config_parses_memory_mb() {
+        let c: HostConfig = serde_json::from_str(r#"{"memory_mb": 512}"#).unwrap();
+        assert_eq!(c.memory_mb, 512);
+    }
+
+    #[test]
+    fn host_config_requires_memory_mb() {
+        assert!(serde_json::from_str::<HostConfig>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<HostConfig>(r#"{"memory_mb": "no"}"#).is_err());
+        assert!(serde_json::from_str::<HostConfig>(r#"not json"#).is_err());
+    }
+
+    #[test]
+    fn share_config_full_and_ro_default() {
+        let c: ShareConfig = serde_json::from_str(
+            r#"{"tag":"ws","path":"C:\\h","instance_id":"c1c1c1c1-3333-4333-8333-333333333333"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.tag, "ws");
+        assert_eq!(c.path, "C:\\h");
+        assert_eq!(c.instance_id, "c1c1c1c1-3333-4333-8333-333333333333");
+        assert!(!c.ro, "ro defaults to false when omitted");
+
+        let ro: ShareConfig =
+            serde_json::from_str(r#"{"tag":"t","path":"p","instance_id":"i","ro":true}"#).unwrap();
+        assert!(ro.ro);
+    }
+
+    #[test]
+    fn share_config_requires_core_fields() {
+        // Missing tag / path / instance_id are all errors.
+        assert!(serde_json::from_str::<ShareConfig>(r#"{"path":"p","instance_id":"i"}"#).is_err());
+        assert!(serde_json::from_str::<ShareConfig>(r#"{"tag":"t","instance_id":"i"}"#).is_err());
+        assert!(serde_json::from_str::<ShareConfig>(r#"{"tag":"t","path":"p"}"#).is_err());
+    }
+
+    // ---- slot_request(): the HcsModifyComputeSystem document --------------------
+
+    #[test]
+    fn slot_request_shapes_add_and_remove() {
+        for rt in ["Add", "Remove"] {
+            let doc = slot_request(rt, "11112222-3333-4444-5555-666677778888", "emul-id");
+            let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            assert_eq!(v["RequestType"], rt);
+            assert_eq!(
+                v["ResourcePath"],
+                "VirtualMachine/Devices/FlexibleIov/11112222-3333-4444-5555-666677778888"
+            );
+            assert_eq!(v["Settings"]["EmulatorId"], "emul-id");
+            assert_eq!(v["Settings"]["HostingModel"], "ExternalRestricted");
+        }
+    }
+
+    // ---- wide(): UTF-16 NUL-terminated encoding ---------------------------------
+
+    #[test]
+    fn wide_is_nul_terminated_utf16() {
+        assert_eq!(wide("AB"), vec![0x41u16, 0x42, 0x00]);
+        assert_eq!(wide(""), vec![0x00u16]);
+    }
+
+    // ---- null-argument contracts on the exported entry points -------------------
+    // These return before any HCS/HDV call, so they're safe to run anywhere.
+
+    #[test]
+    fn host_open_rejects_null_out() {
+        // SAFETY: passing a null out pointer is exactly the contract under test.
+        let rc = unsafe { hvfs_host_open(ptr::null(), ptr::null(), ptr::null_mut()) };
+        assert_eq!(rc, HVFS_ERR_INVALID_ARG);
+    }
+
+    #[test]
+    fn host_open_rejects_null_id_and_clears_out() {
+        // A non-null garbage value the call must overwrite with NULL before returning.
+        let mut out: *mut hvfs_host = ptr::NonNull::dangling().as_ptr();
+        // SAFETY: valid writable out slot; null id is the contract under test.
+        let rc = unsafe { hvfs_host_open(ptr::null(), ptr::null(), &mut out) };
+        assert_eq!(rc, HVFS_ERR_INVALID_ARG);
+        assert!(out.is_null(), "out must be nulled before any early return");
+    }
+
+    #[test]
+    fn host_open_rejects_bad_json_before_touching_platform() {
+        let id = CString::new("nonexistent-system").unwrap();
+        let bad = CString::new("{ not valid json").unwrap();
+        let mut out: *mut hvfs_host = ptr::null_mut();
+        // SAFETY: valid C strings + out slot; the parse failure returns before HCS.
+        let rc = unsafe { hvfs_host_open(id.as_ptr(), bad.as_ptr(), &mut out) };
+        assert_eq!(rc, HVFS_ERR_INVALID_ARG);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn add_share_rejects_null_out_and_host() {
+        // SAFETY: null out is the contract under test.
+        let rc = unsafe { hvfs_add_share(ptr::null_mut(), ptr::null(), ptr::null_mut()) };
+        assert_eq!(rc, HVFS_ERR_INVALID_ARG);
+
+        let mut out: *mut hvfs_share = ptr::null_mut();
+        // SAFETY: valid out slot; null host is the contract under test.
+        let rc = unsafe { hvfs_add_share(ptr::null_mut(), ptr::null(), &mut out) };
+        assert_eq!(rc, HVFS_ERR_INVALID_ARG);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn instance_id_of_null_share_is_null() {
+        // SAFETY: null is an explicitly allowed input.
+        assert!(unsafe { hvfs_share_instance_id(ptr::null()) }.is_null());
+    }
+
+    #[test]
+    fn remove_and_close_null_handles_are_ok() {
+        // SAFETY: null handles are explicit no-ops per the contract.
+        assert_eq!(unsafe { hvfs_remove_share(ptr::null_mut()) }, HVFS_OK);
+        assert_eq!(unsafe { hvfs_host_close(ptr::null_mut()) }, HVFS_OK);
+    }
+
+    #[test]
+    fn set_logger_stub_does_not_crash() {
+        // SAFETY: the stub ignores both arguments today.
+        unsafe { hvfs_set_logger(None, ptr::null_mut()) };
+    }
+
+    #[test]
+    fn last_error_is_null_on_a_fresh_thread() {
+        // LAST_ERROR is thread-local; a brand-new thread has never set it.
+        let p = std::thread::spawn(|| hvfs_last_error() as usize)
+            .join()
+            .unwrap();
+        assert_eq!(p, 0, "a fresh thread's last_error must be NULL");
+    }
+
+    #[test]
+    fn last_error_roundtrips_a_message() {
+        set_last_error("a diagnostic");
+        let p = hvfs_last_error();
+        assert!(!p.is_null());
+        // SAFETY: `p` is the thread-local CString we just set, valid until the next call.
+        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
+        assert_eq!(s, "a diagnostic");
+    }
+}

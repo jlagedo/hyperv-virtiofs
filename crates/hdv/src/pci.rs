@@ -461,3 +461,75 @@ impl PciDevice {
         self.host.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the GUID <-> canonical-string helpers. `guid_from_string`
+    //! validates the caller-supplied `instance_id` at the C ABI boundary, and
+    //! `guid_to_string` emits the form the HCS `FlexibleIov` document requires, so
+    //! their correctness is load-bearing. Comparisons round-trip through
+    //! `guid_to_string` to avoid relying on `GUID: PartialEq`.
+    use super::*;
+
+    #[test]
+    fn to_string_is_canonical_lowercase_no_braces() {
+        assert_eq!(
+            guid_to_string(&VIRTIO_FS_DEVICE_CLASS_ID),
+            "872270e1-a899-4af6-b454-7193634435ad"
+        );
+    }
+
+    #[test]
+    fn well_known_constants_round_trip() {
+        for g in [
+            HVFS_DEVICE_CLASS_ID,
+            HVFS_DEVICE_INSTANCE_ID,
+            HVFS_DEVICE_HOST_ID,
+            VIRTIO_FS_DEVICE_CLASS_ID,
+        ] {
+            let s = guid_to_string(&g);
+            let parsed = guid_from_string(&s).expect("canonical string must parse");
+            assert_eq!(guid_to_string(&parsed), s, "round-trip must be stable");
+        }
+    }
+
+    #[test]
+    fn from_string_accepts_braces_and_uppercase() {
+        let canonical = "872270e1-a899-4af6-b454-7193634435ad";
+        let variants = [
+            "872270E1-A899-4AF6-B454-7193634435AD",     // uppercase
+            "{872270e1-a899-4af6-b454-7193634435ad}",   // braces
+            "  872270e1-a899-4af6-b454-7193634435ad  ", // surrounding whitespace
+            "{872270E1-A899-4AF6-B454-7193634435AD}",   // braces + uppercase
+        ];
+        for v in variants {
+            let g = guid_from_string(v).unwrap_or_else(|| panic!("should parse: {v:?}"));
+            assert_eq!(guid_to_string(&g), canonical, "variant {v:?}");
+        }
+    }
+
+    #[test]
+    fn from_string_rejects_malformed() {
+        let bad = [
+            "",                                           // empty
+            "not-a-guid",                                 // nonsense
+            "872270e1-a899-4af6-b454",                    // too few groups
+            "872270e1-a899-4af6-b454-7193634435ad-extra", // too many groups
+            "872270e1a899-4af6-b454-7193634435ad",        // wrong group lengths
+            "gggggggg-a899-4af6-b454-7193634435ad",       // non-hex digits
+            "872270e1-a899-4af6-b454-7193634435a",        // last group too short
+        ];
+        for b in bad {
+            assert!(guid_from_string(b).is_none(), "should reject {b:?}");
+        }
+    }
+
+    #[test]
+    fn class_id_differs_from_instance_id() {
+        // The product's class and instance constants must not collide.
+        assert_ne!(
+            guid_to_string(&HVFS_DEVICE_CLASS_ID),
+            guid_to_string(&HVFS_DEVICE_INSTANCE_ID)
+        );
+    }
+}

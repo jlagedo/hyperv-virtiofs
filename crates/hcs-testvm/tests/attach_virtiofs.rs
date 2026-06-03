@@ -24,9 +24,9 @@
 //! coherency refinement remains a documented follow-up.
 //!
 //! `#[ignore]` — needs Hyper-V + the Rocky artifacts. Run it:
-//!   $env:HVFS_KERNEL="E:\dev\spike\out\vmlinuz"
-//!   $env:HVFS_INITRD="E:\dev\spike\out\initramfs.cpio.gz"
+//!   .\test\build-guest-artifacts.ps1   # one-time: build test\guest\out artifacts
 //!   cargo test -p hcs-testvm --test attach_virtiofs -- --ignored --nocapture
+//! (Override artifact paths with $env:HVFS_KERNEL / $env:HVFS_INITRD; see docs/testing.md.)
 #![cfg(windows)]
 
 use hcs_testvm::{FlexibleIovSlot, RockyConfig, RockyVm};
@@ -54,10 +54,7 @@ fn make_workspace() -> std::path::PathBuf {
 #[test]
 #[ignore = "requires Hyper-V + Rocky artifacts; run with --ignored"]
 fn guest_mounts_virtiofs_over_hdv() {
-    let kernel =
-        std::env::var("HVFS_KERNEL").unwrap_or_else(|_| r"E:\dev\spike\out\vmlinuz".into());
-    let initrd = std::env::var("HVFS_INITRD")
-        .unwrap_or_else(|_| r"E:\dev\spike\out\initramfs.cpio.gz".into());
+    let (kernel, initrd) = hcs_testvm::artifact_paths();
     assert!(
         std::path::Path::new(&kernel).exists(),
         "kernel not found: {kernel}"
