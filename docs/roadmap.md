@@ -82,12 +82,48 @@ documented, on-demand check; only the build/lint/unit gates are automated.
 
 - Refs: [`testing.md`](testing.md), `.github/workflows/ci.yml`, `test/run-e2e.ps1`.
 
-### Coherent guest memory (aperture eviction)
-The proof masks HDV aperture-cache staleness with a persistent mapping + interrupt re-arm + a
-4-attempt boot retry. For a fully coherent, zero-copy mapping, participate in HDV's aperture
-**eviction protocol** (à la WSL's `HdvGuestMemoryEvictionWorker`), replacing the mitigation.
+### Guest memory: the "aperture staleness" was a `max_address` ceiling bug (RESOLVED)
+For most of this project the `file_selftest` flakiness — guest mounts fine, then stalls/errors
+mid-I/O, worse on sustained transfers — was attributed to **HDV aperture *staleness*** ("snapshot
+semantics"). That diagnosis was **wrong**. Byte-level data-path instrumentation (June 2026,
+`VIRTIO_HDV_TRACE` + `VIRTIO_HDV_APERTURE_STATS`) traced the actual failure to a FUSE reply of
+**`-EIO`** that the guest surfaces as `ls: Invalid argument`, and the EIO to a descriptor buffer at
+GPA **`0x1_0269_1680`** (≈4.04 GiB) being **rejected before it ever reached the aperture path**
+(`bad_range=0`, zero aperture create failures across ~254 k ops).
 
-- Refs: `virtio-hdv` guest-memory aperture path; spike's aperture-staleness notes.
+**Root cause.** Hyper-V splits guest RAM around the 32-bit MMIO hole: low RAM below ~3.75 GiB, the
+remainder **remapped to start at 4 GiB**. A 4 GiB guest therefore references DMA buffers at GPAs
+*above* 4 GiB. We set OpenVMM's `max_address` to the flat RAM size (`memory_mb · 1 MiB =
+0x1_0000_0000`), so every buffer landing in high RAM exceeded the ceiling and `guestmem` rejected it
+**upstream of our fallback** → the FUSE server returned `-EIO`. Flaky because only some allocations
+land high, and **sustained I/O is the most exposed** — which is exactly why it masqueraded as
+"staleness on large transfers."
+
+**Fix** (`crates/virtio-hdv/src/mem.rs`, `ram_size_to_max_gpa`): derive `max_address` from the RAM
+size as `4 GiB + ram_size`, a provably-safe upper bound that admits all real RAM for any low/high
+split (the high region is `ram − low < ram`, so its top is `< 4 GiB + ram`). Result: `file_selftest`
+passes reliably, **including 64 MiB transfers + 500 files** (sha256 write-through verified; ~750–970
+MB/s read, ~160–190 MB/s write), with a healthy on-demand aperture cache (~99.9 % hit rate, quota
+evict-and-retry exercised, zero failures).
+
+**What this retires.** The `PinBackingPages` (rejected `0xC037002E`) and `AllowOvercommit: false`
+(no help) experiments were chasing a backing-coherence problem that **did not exist**: those A/B
+failures were this ceiling bug, not snapshot semantics. The closed
+`HdvGuestMemoryEvictionWorker` is confirmed (by RE of both `vmdevicehost.dll` and
+`wsldevicehost.dll`, see `hdv-aperture-internals.md`) to be **quota/resource management, not a
+coherence-notification protocol** — there is no closed eviction notification to reverse-engineer.
+An HDV aperture is a direct `VidMapMemoryBlockPageRangeEx` of *backed* pages and is coherent; our
+on-demand per-range cache maps only backed pages and reuses them.
+
+**Residual / belt-and-suspenders.** `RearmNet` (5 ms MSI re-arm, `virtio-hdv/src/lib.rs`) and the
+boot-retry remain. They cover a *separate*, much rarer symptom (a fraction of boots stall on
+early-boot guest-memory apertures, and EVENT_IDX notification suppression); they are not proven
+necessary now and removing them is a follow-up spike, to be measured against `file_selftest`, not
+removed blind.
+
+- Refs: `crates/virtio-hdv/src/mem.rs` (`ram_size_to_max_gpa`, on-demand cache, instrumentation),
+  `virtio-hdv/src/lib.rs` (`RearmNet`), `docs/hdv-aperture-internals.md`; public HDV API at
+  learn.microsoft.com/virtualization/api/hcs/reference/hdv.
 
 ---
 

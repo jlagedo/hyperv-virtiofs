@@ -14,10 +14,9 @@
   HVFS_KERNEL / HVFS_INITRD at them, runs the ladder in order, and prints a PASS/FAIL
   summary. It exits non-zero if any rung fails.
 
-  file_selftest is a *best-effort* test (sustained guest I/O gated by the HDV aperture
-  coherence limitation); it is excluded from the green ladder unless you pass
-  -IncludeBestEffort. The two negative spikes (attach, attach_oop) reproduce a platform
-  limitation and *assert success*, so they fail by design; excluded unless -IncludeNegativeSpikes.
+  file_selftest (host-verified sustained virtio-fs I/O) is part of the green ladder. The two
+  negative spikes (attach, attach_oop) reproduce a platform limitation and *assert success*, so
+  they fail by design; excluded unless -IncludeNegativeSpikes.
 
 .PARAMETER Test
   Run only this test target (e.g. boot, attach_virtiofs, hotplug, attach_abi, file_selftest).
@@ -26,7 +25,8 @@
   Build the guest artifacts first (via test\build-guest-artifacts.ps1), even if present.
 
 .PARAMETER IncludeBestEffort
-  Also run file_selftest (sustained I/O; may fail under the aperture-coherence limitation).
+  Reserved. There are currently no best-effort targets (file_selftest is now in the ladder);
+  kept for compatibility, no-op.
 
 .PARAMETER IncludeNegativeSpikes
   Also run attach + attach_oop (expected to fail on current Windows; see docs/testing.md).
@@ -60,14 +60,13 @@ $ladder = @(
   @{ Name = "attach_abi";      Proves = "the shipped C ABI v2 end-to-end (authoritative)" }
   @{ Name = "edge_cases";      Proves = "C ABI rejects bad share input (ro/guid/json) against a live host" }
   @{ Name = "concurrent_processes"; Proves = "Model A: independent device hosts in separate processes mount concurrently" }
+  @{ Name = "file_selftest";   Proves = "data-path integrity over virtio-fs: host-verified sha256, throughput, many-files, unicode names" }
 )
-# Best-effort: exercises sustained guest I/O, which is gated by the unfixed HDV aperture
-# eviction/coherence limitation (docs/share-abi.md, roadmap.md). Passes on a good boot but
-# isn't a reliable gate, so it is NOT part of the green ladder. Run with -IncludeBestEffort
-# or -Test file_selftest.
-$bestEffort = @(
-  @{ Name = "file_selftest"; Proves = "[best-effort] file integrity (host sha256), throughput, many-files, unicode names" }
-)
+# Best-effort: currently none. `file_selftest` was promoted into the ladder once the
+# `max_address` high-RAM ceiling bug was fixed (it was never an aperture-coherence
+# limitation — see docs/testing.md, roadmap.md). The -IncludeBestEffort switch is kept
+# for compatibility and is a no-op until a best-effort target exists again.
+$bestEffort = @()
 $negativeSpikes = @(
   @{ Name = "attach";     Proves = "[expected FAIL] in-process attach without proxy" }
   @{ Name = "attach_oop"; Proves = "[expected FAIL] out-of-process attach without HCS-launched emulator" }
@@ -76,8 +75,10 @@ $negativeSpikes = @(
 if ($List) {
   Write-Host "End-to-end ladder (run in order):`n" -ForegroundColor Cyan
   $ladder | ForEach-Object { "{0,-20} {1}" -f $_.Name, $_.Proves }
-  Write-Host "`nBest-effort (-IncludeBestEffort; gated by the aperture-coherence limitation):" -ForegroundColor Yellow
-  $bestEffort | ForEach-Object { "{0,-20} {1}" -f $_.Name, $_.Proves }
+  if ($bestEffort.Count) {
+    Write-Host "`nBest-effort (-IncludeBestEffort):" -ForegroundColor Yellow
+    $bestEffort | ForEach-Object { "{0,-20} {1}" -f $_.Name, $_.Proves }
+  }
   Write-Host "`nNegative spikes (-IncludeNegativeSpikes; expected to fail by design):" -ForegroundColor Yellow
   $negativeSpikes | ForEach-Object { "{0,-20} {1}" -f $_.Name, $_.Proves }
   return

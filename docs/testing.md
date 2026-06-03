@@ -150,43 +150,45 @@ Windows 11 26200).
 | **`attach_abi`** | the **shipped front door**: drives the exported C functions end-to-end (`hvfs_host_open` → `hvfs_add_share` → `hvfs_share_instance_id` → `hvfs_remove_share` → `hvfs_host_close`) — the authoritative ABI proof | `HOTPLUG_MOUNT_PASS tag=hp1` | 4× | ✅ PASS |
 | **`edge_cases`** | the C ABI **rejects bad input** against a *live* device host: `ro:true` → `NOT_IMPLEMENTED`, non-GUID `instance_id` / malformed JSON / missing field / null arg → `INVALID_ARG`, and the host stays healthy. Needs only a *created* (not started) VM — fast, no retries | (none — assert on return codes) | — | ✅ PASS |
 | **`concurrent_processes`** | **Model A**: spawns two `host_child` processes at once, each opening its own device host on its own VM and hot-adding a share; requires **both** to mount concurrently. Proves the supported "one device host per process" deployment ([`share-abi.md`](share-abi.md#deployment-model--one-device-host-per-process-model-a)) | both children print `CHILD_PASS` | per-child 4× | ✅ PASS |
+| **`file_selftest`** | **data-path integrity** over virtio-fs: multi-MiB **write-through integrity** (host recomputes the guest's sha256), sequential write/read MB/s, a tunable count of small files, and space/unicode/nested names, all cross-checked against the host-visible share. Heaviest, longest sustained I/O of any rung. Promoted to the ladder once the `max_address` ceiling bug (below) was fixed — passes reliably, incl. **64 MiB + 500 files** at ~750–970 MB/s read | `SELFTEST_DONE tag=…` | 6× | ✅ PASS |
 
-`run-e2e.ps1` runs exactly these rungs and they are reliably green. Two tests live **outside**
-the green ladder:
+`run-e2e.ps1` runs exactly these rungs and they are reliably green. Sizes for `file_selftest` are
+tunable from the guest cmdline (`atelier.bigmb`/`perfmb`/`manyn`) without a rebuild. One test lives
+**outside** the green ladder:
 
-- **`file_selftest`** *(best-effort, `-IncludeBestEffort`)* — file-level edge cases + throughput
-  over virtio-fs: multi-MiB **write-through integrity** (the host recomputes the guest's sha256),
-  sequential write/read MB/s, a tunable count of small files, and space/unicode/nested names, all
-  cross-checked against the host-visible share. It does the heaviest, longest sustained device I/O
-  of any test, so it is the one most exposed to the **aperture-coherence limitation** (see below) —
-  it passes on a good boot but can be evicted mid-run, so it is **not a hard gate**. Sizes are kept
-  small and tunable (`atelier.bigmb`/`perfmb`/`manyn` on the guest cmdline) to minimise the
-  device-hold window. Run with `.\test\run-e2e.ps1 -IncludeBestEffort` or
-  `-Test file_selftest`.
 - **`diag_cold_multidevice`** *(diagnostic)* — asserts the platform limitation that two
   *custom*-class FlexibleIov devices are rejected at power-on (`0xC0350005`), i.e. *why* the
   well-known class id is required. Passes today. Run with
   `cargo test -p hcs-testvm --test diag_cold_multidevice -- --ignored --nocapture`.
 
-### The aperture-coherence limitation (why `file_selftest` isn't a gate)
+### The "aperture-coherence limitation" was a `max_address` bug (RESOLVED)
 
-The virtio-fs device reaches guest RAM (virtqueues + data buffers) through **HDV guest-memory
-apertures** (`HdvCreateGuestMemoryAperture`; see `crates/virtio-hdv/src/mem.rs`). An aperture is an
-**evictable page cache**, not a coherent shared mapping — the platform can let a mapped page go stale
-or evict it under pressure (WSL runs an `HdvGuestMemoryEvictionWorker` to manage exactly this, which
-we don't yet mirror). When the device follows a descriptor or copies a buffer through a stale page,
-the queue stalls and the guest sees virtio-fs `EINVAL`/`EIO`. Quick small reads finish inside the
-coherence window (so `attach_abi`/`attach_virtiofs` are reliable); a long sustained I/O session
-(`file_selftest`) is likely to be evicted mid-run. The principled fix — participating in HDV's
-eviction/invalidation protocol — is the roadmap item **"Coherent guest memory (aperture eviction)."**
-Until then, sustained-I/O reliability is bounded, which is why `file_selftest` is best-effort, not a
-ladder gate.
+For most of the project the `file_selftest` flakiness — mounts fine, then errors mid-I/O, worse on
+sustained transfers — was blamed on HDV aperture **snapshot semantics**. That was a misdiagnosis.
+Byte-level data-path tracing (`VIRTIO_HDV_TRACE` + `VIRTIO_HDV_APERTURE_STATS`) showed the device
+replying **`-EIO`** to FUSE (surfacing as `ls: Invalid argument`) because a descriptor buffer at GPA
+**≈4.04 GiB** was rejected **before** the aperture path even ran (`bad_range=0`, zero aperture
+failures over ~254 k ops).
 
-**Why some tests retry.** HDV guest-memory apertures are an evictable cache (no DAX yet;
-see [the roadmap](roadmap.md)). Without the eviction protocol, a fraction of boots hit a
-stale descriptor read and stall. Each attempt is a fresh ~5 s VM, so a few retries
-reliably demonstrate the path while that coherency refinement remains open. A test that
-needs all 4 attempts every run is a smell worth investigating, but 1–2 retries is normal.
+Root cause: Hyper-V splits guest RAM around the 32-bit MMIO hole — low RAM below ~3.75 GiB, the rest
+**remapped above 4 GiB** — so a 4 GiB guest's DMA buffers can sit at `0x1_xxxx_xxxx`. We set
+OpenVMM's `max_address` to the flat RAM size (`memory_mb · 1 MiB = 4 GiB`), so high-RAM buffers
+exceeded the ceiling and `guestmem` rejected them → `-EIO`. Flaky because only some allocations land
+high; **sustained I/O is most exposed**, which is why it looked like "staleness on large transfers."
+
+Fixed in `crates/virtio-hdv/src/mem.rs` (`ram_size_to_max_gpa`: `max_address = 4 GiB + ram_size`, a
+safe upper bound for any split). `file_selftest` now passes reliably including 64 MiB transfers; the
+on-demand aperture cache runs at ~99.9 % hit rate with zero failures. The HCS-config experiments
+(`Memory.PinBackingPages` rejected `0xC037002E`; `AllowOvercommit:false` "still stalls") were
+chasing a backing-coherence problem that didn't exist — those failures were this ceiling bug. An HDV
+aperture is a direct `VidMapMemoryBlockPageRangeEx` of *backed* pages and is coherent; the closed
+`HdvGuestMemoryEvictionWorker` is quota management, **not** a coherence protocol (see
+[`hdv-aperture-internals.md`](hdv-aperture-internals.md)).
+
+**Why some tests still retry.** A separate, much rarer effect: HDV guest-memory apertures are an
+evictable cache (no DAX yet; see [the roadmap](roadmap.md)), so a fraction of *boots* stall on the
+early-boot guest-memory mapping. Each attempt is a fresh ~5 s VM, so 1–2 retries are normal; needing
+all attempts every run is a smell worth investigating.
 
 ### Negative spikes (expected to fail)
 
@@ -295,7 +297,7 @@ additionally uses the `attach_child` helper binary
 | `from_proxy … 0xC0370030` | Only **one** HDV device host is allowed per VM; share one `Arc<DeviceHost>` across devices (this is what `hotplug` stage 2 does). |
 | `from_proxy … 0x80070005` (`E_ACCESSDENIED`) + a possible crash | Two device hosts were registered **in one process** — the unsupported topology. Use one device host per process (Model A); in tests, pass `--test-threads=1` (the runner does). |
 | Live remove returns `0x80070032` (`ERROR_NOT_SUPPORTED`) | Expected — the platform refuses `FlexibleIov` Remove; devices reclaim at VM teardown ([`share-abi.md`](share-abi.md), [`roadmap.md`](roadmap.md)). |
-| Flaky: passes after a couple of retries | Normal — aperture-cache staleness (see "Why some tests retry"). Consistent need for all 4 attempts is worth a look. |
+| Flaky: passes after a couple of retries | Normal — a fraction of boots stall on the early-boot guest-memory aperture (see "Why some tests still retry"). Consistent need for all attempts is worth a look. |
 
 ---
 

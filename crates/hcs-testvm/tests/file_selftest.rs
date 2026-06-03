@@ -101,9 +101,9 @@ fn guest_file_selftest_over_virtiofs() {
 
 fn try_selftest(kernel: &str, initrd: &str, ws: &std::path::Path) -> bool {
     let mut cfg = RockyConfig::new(kernel, initrd);
-    // Keep the self-test's transfers modest: large sustained I/O is the most exposed to
-    // HDV aperture-cache staleness, and the goal here is integrity + a measurable rate,
-    // not a stress test. (Tunable via the guest cmdline without a rebuild.)
+    // Modest transfers: the goal here is integrity + a measurable rate, not a stress test.
+    // (Tunable via the guest cmdline without a rebuild — sustained 64 MiB transfers also pass
+    // since the high-RAM `max_address` ceiling bug was fixed; see docs/testing.md.)
     cfg.kernel_cmdline = format!(
         "console=ttyS0 atelier.hptags={TAG} atelier.fileperf=1 atelier.bigmb=4 atelier.perfmb=8 atelier.manyn=100"
     );
