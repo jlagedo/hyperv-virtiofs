@@ -36,7 +36,10 @@ impl SignalMsi for HdvSignalMsi {
         // once the guest is running, since binding precedes Start).
         if let Some(device) = self.handle.get() {
             {
-                let mut seen = self.seen.lock().unwrap();
+                // Poison-tolerant: MSI delivery runs un-guarded; a poisoned lock
+                // (panic caught at a guarded boundary) must not unwind it. The set
+                // is structurally valid.
+                let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
                 if !seen.contains(&(address, data)) {
                     seen.push((address, data));
                 }

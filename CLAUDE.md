@@ -1,179 +1,124 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this is
 
-"virtiofsd for Hyper-V." A standalone C-ABI DLL (`hyperv_virtiofs.dll`) that attaches an
-[OpenVMM](https://github.com/microsoft/openvmm) **virtio-fs** device to *any* HCS/Hyper-V
-guest via the Windows **Host Device Virtualization (HDV)** API — sharing a host directory
-into a VM over virtio-fs with no 9p and no in-box device support. It is the open
-re-implementation of the device-host glue that ships closed inside WSL's
-`wsldevicehost.dll`.
+"virtiofsd for Hyper-V": a **Windows-only** C-ABI DLL (`hyperv_virtiofs.dll`) that attaches
+an OpenVMM virtio-fs device to any HCS/Hyper-V guest via the **Host Device Virtualization
+(HDV)** API. Open re-implementation of the glue in WSL's closed `wsldevicehost.dll`. The
+OpenVMM virtio/virtiofs crates are **reused** (pinned git deps), not reimplemented.
 
-**Windows-only product.** The lower crates compile (inertly) off-Windows so the workspace
-checks elsewhere, but nothing runs without Hyper-V.
+Lower crates compile off-Windows (so `cargo check` works elsewhere) but nothing runs
+without Hyper-V.
 
 ## Build & test
 
-Prerequisites: Rust 1.95+ (pinned in `rust-toolchain.toml`) and **`protoc`** on `PATH`
-(or `PROTOC` env var) — the reused OpenVMM crates pull `mesh → prost → protobuf`, whose
-build needs the Protocol Buffers compiler. The OpenVMM crates are git deps pinned to one
-revision in the workspace `Cargo.toml`; the first build fetches that large tree.
+- **`protoc` must be on `PATH`** (or set `PROTOC`) — the build won't compile without it.
+- Toolchain is pinned in `rust-toolchain.toml`.
 
 ```pwsh
-cargo build --release        # -> target/release/hyperv_virtiofs.dll (+ .dll.lib, .pdb)
+cargo build --release        # -> target/release/hyperv_virtiofs.dll
 cargo test --workspace       # unit tests only; integration tests are #[ignore]
 cargo clippy --workspace --all-targets -- -D warnings   # CI gate (warnings = error)
 cargo fmt --all --check                                  # CI gate
 ```
 
-### Regenerating the C header (required after any ABI change)
-
-`include/hyperv_virtiofs.h` is **generated, committed, and CI-verified** — CI fails if it
-drifts from the Rust source. After changing any `#[no_mangle]` signature or public ABI
-type in `crates/hyperv_virtiofs/src/lib.rs`, regenerate and commit:
+**After any ABI change** (a `#[no_mangle]` signature or public type in
+`crates/hyperv_virtiofs/src/lib.rs`), regenerate the committed header — CI fails on drift:
 
 ```pwsh
 cbindgen --config cbindgen.toml --crate hyperv_virtiofs --output include/hyperv_virtiofs.h
 ```
 
-### Integration tests (live VM — gated)
+### Integration tests (live VM, gated)
 
-All tests in `crates/hcs-testvm/tests/` are `#[ignore]` because they need a Hyper-V host
-and Rocky Linux kernel/initramfs artifacts (not on CI). The whole e2e tier — prerequisites,
-the ladder, the guest↔test sentinel contract, and troubleshooting — is documented in
-**`docs/testing.md`**; the reproducible tooling lives in **`test/`**:
+`crates/hcs-testvm/tests/` are `#[ignore]` (need a Hyper-V host + guest artifacts). Full
+tier in **`docs/testing.md`**.
 
 ```pwsh
-.\test\build-guest-artifacts.ps1   # once: build test\guest\out\ (Rocky kernel + initramfs, via WSL+Docker)
-.\test\run-e2e.ps1                 # run the ladder, print a PASS/FAIL summary
-.\test\run-e2e.ps1 -Test attach_abi   # or one rung
+.\test\build-guest-artifacts.ps1   # once: build guest kernel+initramfs (WSL+Docker); git-ignored
+.\test\run-e2e.ps1                 # run the ladder; -Test <name> for one rung
 ```
 
-Artifact paths resolve via `hcs_testvm::artifact_paths()`: `HVFS_KERNEL` / `HVFS_INITRD`
-override, else the in-repo `test/guest/out/` default — so a plain
-`cargo test -p hcs-testvm --test attach_abi -- --ignored --nocapture` works after a build,
-no env vars needed. The artifacts are git-ignored (built, not committed); the two inputs
-that define them — `test/guest/build-rocky-initramfs.sh` and the guest `test/guest/init`
-self-test — are committed.
-
-**The guest `init` and the Rust tests are coupled by exact console sentinels** (e.g.
-`PROOF_COMPLETE_PASS`, `GUEST_READY`, `HOTPLUG_MOUNT_PASS tag=…`). Changing a sentinel
-means updating the consuming test *and* rebuilding the artifacts — see the contract table
-in `docs/testing.md`.
-
-Test ladder (each proves one more layer; `docs/` has the design notes):
-- `boot.rs` — Rocky boots under HCS, reaches userspace (validates the rig).
-- `attach_proxy.rs` — the `ExternalRestricted` FlexibleIov proxy handshake (`docs/hdv-proxy-abi.md`).
-- `attach_virtiofs.rs` — the real `VirtioHdvDevice` transport: guest **mounts** and reads a file (device attached *before* start).
-- `hotplug.rs` — hot-add a device-per-share to an *already-running* VM (`docs/hotplug-spike.md`).
-- `attach_abi.rs` — the shipped front door: drives the exported C functions end-to-end (the authoritative ABI proof).
-- `edge_cases.rs` — the C ABI rejects bad share input (`ro`/GUID/JSON/null) against a *live* host; needs only a created (not started) VM, so it's fast.
-- `file_selftest.rs` — **green-ladder rung**: data-path integrity + throughput over virtio-fs — multi-MiB write-through integrity (host recomputes the guest's sha256), MB/s, many-files, unicode/nested names, via the guest's opt-in `atelier.fileperf` self-test in `test/guest/init`. Covers up to 64 MiB transfers (`docs/testing.md`).
-- `concurrent_processes.rs` — **Model A** proof: two `host_child` processes, each its own device host + VM, hot-add a share and mount concurrently. The supported deployment is **one device host per process** (see `docs/share-abi.md`); driving multiple hosts in one process is out of scope (the in-process proxy path races — `from_proxy` → `0x80070005`).
-- `attach.rs` / `attach_oop.rs` — **negative spikes**: they assert success and so *fail by
-  design* on current Windows, standing as reproductions of why the proxy path is required.
-  Excluded from `run-e2e.ps1` unless `-IncludeNegativeSpikes`.
-- `diag_cold_multidevice.rs` — standalone **diagnostic** (passes): asserts two *custom*-class
-  cold devices are rejected at power-on (`0xC0350005`), i.e. why the well-known class id is
-  required. Not in the green ladder.
-
-Offline **unit tests** (run on CI via `cargo test --workspace`) cover the ABI's
-deterministic surface — `hyperv_virtiofs` (`src/lib.rs` `mod tests`: panic guard, null/arg
-contracts, `host_json`/`share_json` parsing, request shaping) and `hdv::pci` GUID
-parse/format round-trips.
-
-These tests retry attach+boot a few times on purpose: HDV guest-memory apertures are an
-evictable cache, so a fraction of boots stall — each retry is a fresh VM.
+- The guest `test/guest/init` and the Rust tests are coupled by exact console sentinels
+  (`PROOF_COMPLETE_PASS`, `GUEST_READY`, …). Changing one means updating the test *and*
+  rebuilding artifacts.
+- Tests retry attach+boot on purpose (HDV apertures are an evictable cache; some boots
+  stall) — don't "fix" the retries.
 
 ## Architecture
 
-The product surface is **only** the C ABI in `include/hyperv_virtiofs.h` — five calls,
-no consumer-specific concepts (only compute systems, device hosts, shares, tags,
-read-only). Bindings live with each *consumer*, not here (Go consumers use
-`syscall.NewLazyDLL`, no cgo). `examples/c/main.c` is the authoritative reference;
-`examples/go/` is illustrative only.
+Product surface is **only** the C ABI in `include/hyperv_virtiofs.h` (five calls). Consumer
+bindings live with each consumer, not here; `examples/c/main.c` is authoritative.
 
-### Crate layering (bottom-up; lower three are a reusable, device-agnostic HDV toolkit)
+Crate layering (bottom-up; lower three are a device-agnostic HDV toolkit):
 
 | Crate | Responsibility |
 |---|---|
-| `hdv-sys` | Raw FFI to the HDV API (`vmdevicehost.dll`): device hosts, guest-memory apertures, doorbells, the proxy ABI. |
-| `hdv` | Safe RAII over `hdv-sys` (`DeviceHost`, `Device`, `Aperture`, `pci`, `proxy`). Knows nothing about virtio. |
-| `virtio-hdv` | Adapts OpenVMM's public `VirtioPciDevice`/`VirtioFsDevice` onto HDV: implements `hdv::pci::PciOps`, backing guest memory ← apertures, MSI-X ← `HdvDeliverGuestInterrupt`, PCI config/BAR MMIO ← HDV vtable callbacks. Device-neutral transport. |
-| `hyperv_virtiofs` | The `cdylib` (+ `rlib` for in-process tests). Wires OpenVMM's `virtiofs` onto `virtio-hdv` and exposes the C ABI. **The whole product.** |
-| `hcs-sys` | Raw FFI to HCS (`computecore.dll`): open/modify/close compute systems, operations. |
-| `hcs-testvm` | Test-only rig: stands up a throwaway Rocky VM via HCS with direct kernel boot, captures serial over a named pipe, hands a live `HCS_SYSTEM` to HDV. Not shipped. |
-
-`virtio-hdv` is the open re-implementation of one internal WSL file (`virtio_hdv.rs`) over
-otherwise-public OpenVMM crates. The OpenVMM virtio device model, queue/guest-memory
-machinery, and FUSE server are **reused** (pinned git deps), not reimplemented.
+| `hdv-sys` | Raw FFI to HDV (`vmdevicehost.dll`). |
+| `hdv` | Safe RAII over `hdv-sys` (`DeviceHost`, `Device`, `Aperture`, `pci`, `proxy`); no virtio. |
+| `virtio-hdv` | Adapts OpenVMM's `VirtioPciDevice`/`VirtioFsDevice` onto HDV (`PciOps`, apertures, MSI-X, BAR MMIO). Device-neutral. |
+| `hyperv_virtiofs` | The `cdylib`; wires OpenVMM's `virtiofs` onto `virtio-hdv`, exposes the C ABI. **The product.** |
+| `hcs-sys` | Raw FFI to HCS (`computecore.dll`). |
+| `hcs-testvm` | Test-only rig (throwaway Rocky VM via HCS). Not shipped. |
 
 ### Object model (`docs/share-abi.md`, ABI v2)
 
-- A `hvfs_host` is **one HDV device host** per compute system (the platform rejects a
-  second), registered via the `ExternalRestricted` proxy path **before the VM starts**.
-- N `hvfs_share`s ride it, each **one virtio-fs device == one shared directory**,
-  **hot-added at runtime** (after start) via `HcsModifyComputeSystem` Add of a
-  `FlexibleIov` slot. Multiple shares coexist via the well-known virtio-fs class id +
-  caller-supplied unique `instance_id`.
-- ABI flow: `hvfs_host_open` → (caller starts VM) → `hvfs_add_share` →
-  `hvfs_share_instance_id` → `hvfs_remove_share` → `hvfs_host_close`.
+- One `hvfs_host` = one HDV device host per compute system (platform rejects a second),
+  registered via the `ExternalRestricted` proxy path **before the VM starts**.
+- N `hvfs_share`s, each one virtio-fs device == one directory, **hot-added after start** via
+  `HcsModifyComputeSystem` Add of a `FlexibleIov` slot. They coexist via the well-known
+  class id + a caller-supplied `instance_id`.
+- Flow: `hvfs_host_open` → caller starts VM → `hvfs_add_share` → `hvfs_share_instance_id`
+  → `hvfs_remove_share` → `hvfs_host_close`.
 
-## ABI contract rules (load-bearing — do not weaken)
+## ABI contract rules (do not weaken)
 
-- Every fn returns `i32`: `0` = OK, `< 0` = error. On error, `hvfs_last_error()` holds a
-  **thread-local** message (borrowed, valid until the next call on that thread).
-- Handles (`hvfs_host*`, `hvfs_share*`) are opaque, never passed by value.
-- **Every `const char*` is borrowed** — caller owns inputs, outputs are thread-local or
-  via the logger callback. Nothing crosses the allocator boundary; there is no `free`.
-- **No Rust panic ever crosses the boundary**: every entry point runs inside `guard()`
-  (`catch_unwind`) and returns `HVFS_ERR_PANIC`. `panic = "unwind"` is pinned in *both*
-  release and dev profiles in the workspace `Cargo.toml` precisely to keep this contract.
-- The ABI won't claim a guarantee it can't keep: `ro: true` returns
-  `HVFS_ERR_NOT_IMPLEMENTED`; live `FlexibleIov` Remove returns `HVFS_ERR_UNSUPPORTED`
-  (the platform refuses it — devices are reclaimed at VM teardown, as WSL relies on).
-- Bump `HVFS_ABI_VERSION` (currently `2`) on any breaking ABI change.
-- In `hvfs_host`, **struct field order is drop order and is load-bearing**: shares' HDV
-  devices tear down before the device host, before the COM support object, before the HCS
-  handle closes.
+- Every fn returns `i32` (`0` = OK, `< 0` = error); `hvfs_last_error()` holds a thread-local
+  borrowed message.
+- Handles are opaque, never passed by value. Every `const char*` is borrowed — nothing
+  crosses the allocator boundary, there is no `free`.
+- **No panic crosses the boundary**: entry points run in `guard()` → `HVFS_ERR_PANIC`.
+  `panic = "unwind"` is pinned in both profiles to keep this — don't change it.
+- Don't claim guarantees we can't keep: `ro: true` → `HVFS_ERR_NOT_IMPLEMENTED`; live Remove
+  → `HVFS_ERR_UNSUPPORTED`.
+- Bump `HVFS_ABI_VERSION` on any breaking change.
+- In `hvfs_host`, **struct field order is drop order** (shares → device host → COM object →
+  HCS handle) — load-bearing.
 
-## Logging & diagnostics (the pattern to follow)
+## Trust boundaries & safety
 
-Follow OpenVMM's convention — **structured `tracing`, never ad-hoc prints, and the emitter
-never decides the destination**:
+The guest is untrusted; guest-triggerable paths (config/BAR MMIO, DMA ranges, MSI, queues)
+must never panic out of bounds.
 
-- **Emit with `tracing` macros**, not `println!`/`eprintln!`: `tracing::info!/warn!/error!/
-  debug!/trace!` with **key-value fields**, not pre-formatted strings — e.g.
-  `tracing::warn!(gpa, len, "aperture map failed")`.
-- **Rate-limit anything a guest can trigger repeatedly** so it can't spam the log — use the
-  local `crate::ratelimit::warn_ratelimited!` in `virtio-hdv` (our stand-in for OpenVMM's
-  `tracelimit`). Bare `tracing::warn!` is for one-shot/host-side events.
-- **`println!`/`eprintln!` is only for**: user-facing CLI/program output, `build.rs` cargo
-  directives, dev tooling, and tests (e.g. `hcs-testvm`). **Never** as the logging mechanism
-  for library/runtime code.
-- **Routing is a separate concern, set once.** Call sites only emit; *where* logs go is
-  decided by the `tracing_subscriber` the `hyperv_virtiofs` cdylib installs
-  (`crates/hyperv_virtiofs/src/logging.rs`): the `hvfs_set_logger` C callback, and stderr
-  when a dev env var is set (`VIRTIO_HDV_TRACE` firehose, `VIRTIO_HDV_APERTURE_STATS` cache
-  stats; otherwise `RUST_LOG`, default info). Adding a sink never touches a call site.
+- **Never abort the host** — we're a DLL in someone else's process. Entry points → `guard()`
+  → `HVFS_ERR_PANIC`; HDV callbacks → `guard_hr()` → `E_FAIL`. Never use `panic = "abort"`.
+- **No `.unwrap()`/`.expect()` on boundary data.** Bounds-check guest DMA; unknown protocol
+  values are a no-op, not a panic. `Mutex::lock().unwrap()` is fine on a guarded path, not on
+  the un-guarded worker threads (re-arm, poll, MSI).
+- **Typed errors, hand-rolled** (`hdv::Error`/`Result`, `AttachError`, C `i32` +
+  `hvfs_last_error()`). Don't add `thiserror`/`anyhow`.
+- **Isolate `unsafe`**: raw FFI in `*-sys`, safe RAII in `hdv`; every `unsafe` gets a
+  `# Safety` comment.
+- Prefer hand-rolled utilities over new external crates.
+
+## Logging & diagnostics
+
+Structured `tracing`, never ad-hoc prints; the emitter never picks the destination.
+
+- Emit `tracing` macros with key-value fields (`tracing::warn!(gpa, len, "...")`), not
+  `println!`/`eprintln!`.
+- Rate-limit guest-triggerable events with `crate::ratelimit::warn_ratelimited!`.
+- `println!`/`eprintln!` only in CLI output, `build.rs`, dev tooling, tests.
+- Routing is set once in `crates/hyperv_virtiofs/src/logging.rs` (the `hvfs_set_logger`
+  callback + stderr when `VIRTIO_HDV_TRACE`/`VIRTIO_HDV_APERTURE_STATS`/`RUST_LOG` is set).
 
 ## Known platform constraints
 
-- Live share **removal** is platform-blocked (`FlexibleIov` Remove returns
-  `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` = `0x80070032`); reclaim happens at teardown.
-- No DAX yet: `shmem_size = 0`, so no shared-memory BAR. Guest memory is reached via an
-  **on-demand per-range aperture cache** (`crates/virtio-hdv/src/mem.rs`); `max_address` is
-  derived as `4 GiB + ram_size` (`ram_size_to_max_gpa`) to admit RAM remapped above the 4 GiB
-  MMIO hole. An interrupt re-arm net + boot retry guard a rarer boot-stall/EVENT_IDX window.
-- **One device host per process (Model A).** The DLL registers a device host in the calling
-  process; the supported deployment runs each VM's device host in its own process (as WSL
-  does). Registering multiple device hosts in one process is unsupported — the in-process
-  proxy registration races the closed platform (`HdvInitializeDeviceHostForProxy` →
-  `E_ACCESSDENIED 0x80070005`), and we deliberately don't lock around it (it would imply a
-  multi-host-per-process safety the platform's teardown/IPC/aperture paths don't give us).
-  See `docs/share-abi.md` ("Deployment model").
-
-Open work (live removal, `ro` enforcement, self-hosted e2e CI) is tracked in
-`docs/roadmap.md`.
+- Live share **removal** is platform-blocked (`FlexibleIov` Remove → `0x80070032`); reclaim
+  happens at VM teardown.
+- No DAX (`shmem_size = 0`): guest memory via an on-demand aperture cache
+  (`crates/virtio-hdv/src/mem.rs`). `max_address = 4 GiB + ram_size` (`ram_size_to_max_gpa`)
+  to admit RAM above the 4 GiB MMIO hole — **don't set it to flat `ram_size`**.
+- **One device host per process (Model A):** each VM's device host runs in its own process.
+  Multiple hosts in one process is unsupported (in-process proxy registration races →
+  `E_ACCESSDENIED 0x80070005`); we deliberately don't lock around it. See `docs/share-abi.md`.

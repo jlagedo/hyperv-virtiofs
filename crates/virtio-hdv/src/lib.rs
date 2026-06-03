@@ -111,7 +111,10 @@ impl RearmNet {
                 while !stop2.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(5));
                     let Some(device) = handle.get() else { continue };
-                    let pairs = seen.lock().unwrap().clone();
+                    // Poison-tolerant: this is an un-guarded worker thread, so a
+                    // poisoned lock (from a panic caught at a guarded boundary) must
+                    // degrade, not unwind it. The inner `Vec` is structurally valid.
+                    let pairs = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     for (address, data) in pairs {
                         let _ = device.deliver_interrupt(address, data);
                     }
@@ -238,7 +241,13 @@ impl VirtioHdvDevice {
         let poll_dev = dev.clone();
         let poll_task = driver.spawn("virtio-hdv-poll", async move {
             std::future::poll_fn(|cx| {
-                poll_dev.lock().unwrap().poll_device(cx);
+                // Poison-tolerant: an un-guarded executor task must not unwind on a
+                // poisoned device lock (poison comes from a panic already caught at a
+                // guarded MMIO boundary); the device state is structurally valid.
+                poll_dev
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .poll_device(cx);
                 Poll::<()>::Pending
             })
             .await
