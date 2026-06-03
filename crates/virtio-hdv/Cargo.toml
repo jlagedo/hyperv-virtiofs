@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+# Internal workspace crate; OpenVMM git deps bar crates.io publishing.
+publish = false
 
 [dependencies]
 hdv = { path = "../hdv" }

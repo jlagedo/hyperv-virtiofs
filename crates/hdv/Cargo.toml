@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+# Internal workspace crate; not published to crates.io.
+publish = false
 
 [dependencies]
 hdv-sys = { path = "../hdv-sys" }

@@ -84,3 +84,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # Auto-generate the commit/PR changelog and prepend a short artifact
+          # guide so the Release page isn't blank. See CHANGELOG.md for the
+          # curated, human-written notes.
+          generate_release_notes: true
+          body: |
+            `hyperv_virtiofs.dll` — virtio-fs over Hyper-V (HDV). C ABI v2.
+
+            **Artifacts**
+            - `hyperv_virtiofs.dll` — the library (load it; no `cargo` needed by consumers)
+            - `hyperv_virtiofs.dll.lib` — import lib for C/C++ linking
+            - `hyperv_virtiofs.pdb` — debug symbols
+            - `hyperv_virtiofs.h` — the C ABI contract header
+
+            See [CHANGELOG.md](https://github.com/jlagedo/hyperv-virtiofs/blob/main/CHANGELOG.md)
+            for curated notes and [docs/share-abi.md](https://github.com/jlagedo/hyperv-virtiofs/blob/main/docs/share-abi.md)
+            for the ABI contract.

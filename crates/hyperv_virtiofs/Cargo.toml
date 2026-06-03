@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+# Ships as a binary DLL, not a crates.io crate (and the OpenVMM git deps would
+# bar publishing anyway). Guard against an accidental `cargo publish`.
+publish = false
 
 [lib]
 # cdylib -> hyperv_virtiofs.dll (+ import .lib + .pdb). rlib so the examples and
