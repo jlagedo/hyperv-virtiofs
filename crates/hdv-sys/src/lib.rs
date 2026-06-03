@@ -32,6 +32,12 @@ pub type HDV_HOST = *mut c_void;
 pub type HDV_DEVICE = *mut c_void;
 
 pub const S_OK: HRESULT = 0;
+/// Standard COM error codes, returned from callbacks whose Rust body panicked or
+/// was handed bad arguments — so a failure crosses the FFI boundary as an HRESULT
+/// rather than unwinding into HDV.
+pub const E_POINTER: HRESULT = 0x8000_4003u32 as HRESULT;
+pub const E_FAIL: HRESULT = 0x8000_4005u32 as HRESULT;
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002u32 as HRESULT;
 
 /// Win32 `GUID` (a.k.a. `IID`/`CLSID`).
 #[repr(C)]

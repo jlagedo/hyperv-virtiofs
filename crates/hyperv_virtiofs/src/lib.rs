@@ -503,7 +503,7 @@ pub unsafe extern "C" fn hvfs_remove_share(share: *mut hvfs_share) -> i32 {
         }
         // SAFETY: caller contract — live handle, host still open.
         let s = unsafe { &*share };
-        let instance = s.instance_id.to_string_lossy().into_owned();
+        let instance = s.instance_id.to_string_lossy();
         let req = slot_request("Remove", &instance, &s.emulator_id.to_string_lossy());
         // SAFETY: the share borrows a system handle live while its host is open.
         let outcome = match unsafe { hcs_modify(s.system, &req) } {

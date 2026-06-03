@@ -20,9 +20,9 @@ use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-/// `E_FAIL` — returned from a callback whose Rust body panicked, so a panic never
-/// unwinds across the FFI boundary into HDV.
-const E_FAIL: sys::HRESULT = 0x8000_4005u32 as sys::HRESULT;
+// `E_FAIL` (and the other COM codes) live in `hdv-sys` so panics never unwind
+// across the FFI boundary into HDV — they cross as an HRESULT instead.
+use sys::E_FAIL;
 
 /// The product's **well-known** device class/instance GUIDs. These are fixed
 /// constants (Decision A): a consumer must declare its HCS **`FlexibleIov`** slot

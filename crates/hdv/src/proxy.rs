@@ -21,9 +21,7 @@ use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-const E_FAIL: sys::HRESULT = 0x8000_4005u32 as sys::HRESULT;
-const E_NOINTERFACE: sys::HRESULT = 0x8000_4002u32 as sys::HRESULT;
-const E_POINTER: sys::HRESULT = 0x8000_4003u32 as sys::HRESULT;
+use sys::{E_FAIL, E_NOINTERFACE, E_POINTER};
 
 /// `IID_IUnknown` `{00000000-0000-0000-C000-000000000046}`.
 const IID_IUNKNOWN: sys::GUID = sys::GUID {
