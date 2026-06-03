@@ -141,7 +141,16 @@ int32_t hvfs_host_close(hvfs_host *host);
 const char *hvfs_last_error(void);
 
 /**
- * Install a process-global logger. Set once at load, before [`hvfs_host_open`].
+ * Install a process-global logger. Call once at load, ideally before
+ * [`hvfs_host_open`]. `cb` receives `(level, message, ctx)`: `level` is a syslog
+ * severity (3=err, 4=warning, 6=info, 7=debug/trace); `message` is a borrowed,
+ * NUL-terminated string valid only for the duration of the call; `ctx` is returned
+ * verbatim. The logger receives both this DLL's own events and the underlying
+ * OpenVMM device-host stream. `cb = NULL` disables delivery.
+ *
+ * Best-effort: the DLL installs a process-global log subscriber only if the host
+ * process hasn't already installed one. If it has, the host owns routing and the
+ * callback may receive nothing. Verbosity follows `RUST_LOG` (default: info).
  *
  * # Safety
  * `cb` must remain a valid function pointer for the process lifetime; `ctx` is

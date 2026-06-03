@@ -200,8 +200,8 @@ troubleshooting — is in [`docs/testing.md`](docs/testing.md).
 ## Roadmap
 
 What's **shipped** and what's still **open** — live share removal (platform-blocked), `ro`
-enforcement, caller-supplied GUIDs, logger wiring, and coherent guest memory — is tracked in
-one place: [`docs/roadmap.md`](docs/roadmap.md).
+enforcement, and self-hosted e2e CI — is tracked in one place:
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Contributing & security
 

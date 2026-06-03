@@ -35,6 +35,13 @@ pal_event = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7
 pal_async = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 inspect = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 
+# Logging. We follow OpenVMM's convention — emit structured `tracing` events and
+# route them by composing subscriber layers (see CLAUDE.md "Logging & diagnostics").
+# Versions match OpenVMM's pins so the lockfile shares one resolution. `env-filter`
+# is not a default feature; we need it for RUST_LOG / VIRTIO_HDV_* level control.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # A panic must never abort across the C ABI boundary: the cdylib catches it
 # (std::panic::catch_unwind) and returns an error code instead. unwind is the
 # default, but pin it so a future profile change can't silently break the contract.

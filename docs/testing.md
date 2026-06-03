@@ -161,6 +161,22 @@ tunable from the guest cmdline (`atelier.bigmb`/`perfmb`/`manyn`) without a rebu
   well-known class id is required. Passes today. Run with
   `cargo test -p hcs-testvm --test diag_cold_multidevice -- --ignored --nocapture`.
 
+### Capturing diagnostics
+
+All runtime diagnostics are structured `tracing` events (see `CLAUDE.md`, "Logging &
+diagnostics"); the `hyperv_virtiofs` cdylib installs the subscriber that routes them. Two ways
+to see them:
+
+- **stderr** — set a dev env var before the run. `VIRTIO_HDV_TRACE=1` raises the transport to
+  TRACE (the per-access data-path firehose, incl. ≤64 B byte dumps of rings/descriptors/FUSE
+  headers); `VIRTIO_HDV_APERTURE_STATS=1` emits the aperture-cache stats event; `RUST_LOG`
+  controls verbosity otherwise (default info). The e2e tests run with `--nocapture`, so these
+  land in the test output (e.g. `cargo test … attach_abi -- --ignored --nocapture` with
+  `VIRTIO_HDV_TRACE=1` prints `… TRACE virtio_hdv: read_config …`).
+- **a C callback** — a consumer (or the C example) passes `hvfs_set_logger(cb, ctx)`; the same
+  event stream arrives with a syslog `level`. Best-effort: if the host process already owns a
+  global `tracing` subscriber, that one wins.
+
 ### The "aperture-coherence limitation" was a `max_address` bug (RESOLVED)
 
 For most of the project the `file_selftest` flakiness — mounts fine, then errors mid-I/O, worse on

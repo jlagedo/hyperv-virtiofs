@@ -56,23 +56,6 @@ already works; enabling `ro: true` just stops returning the not-implemented code
 
 - Refs: the `ro` branch in `hvfs_add_share` (`crates/hyperv_virtiofs/src/lib.rs`), `ShareConfig.ro`.
 
-### Caller-supplied class / host GUIDs
-The device **instance** id is already caller-chosen (`hvfs_add_share`'s `instance_id`). Still fixed:
-- the device **class** id — pinned to the well-known `VIRTIO_FS_DEVICE_CLASS_ID` because the VID
-  refuses a second virtio-fs device under any *custom* class (a platform constraint, not a choice;
-  see the spike). Unlikely to ever be caller-chosen for virtio-fs.
-- the device-**host** id — a built-in constant (`HVFS_DEVICE_HOST_ID`). Let the caller override it
-  so the host can coexist with another device host where the platform allows.
-
-- Refs: `// TODO(caller-guids)` in `crates/hdv/src/pci.rs` (the constants + `create_shared`).
-
-### Wire `hvfs_set_logger`
-`hvfs_set_logger` is currently a **no-op stub** — it accepts `(cb, ctx)` and ignores them
-(`crates/hyperv_virtiofs/src/lib.rs`, `// TODO: store cb/ctx…`). The header advertises it as
-"install a process-global logger", so until it is wired this is an unfulfilled promise. Store the
-callback in a global and route the device-host log stream to it. (Consider disclosing "not yet
-wired" in the header doc comment + regenerating until it lands, to stay honest like `ro`.)
-
 ### End-to-end CI on a self-hosted Hyper-V runner
 The e2e ladder ([`testing.md`](testing.md)) is reproducible locally but doesn't run on hosted CI —
 GitHub `windows-latest` has no nested virtualization, so HCS/HDV can't create a VM. To gate merges on
@@ -82,54 +65,45 @@ documented, on-demand check; only the build/lint/unit gates are automated.
 
 - Refs: [`testing.md`](testing.md), `.github/workflows/ci.yml`, `test/run-e2e.ps1`.
 
-### Guest memory: the "aperture staleness" was a `max_address` ceiling bug (RESOLVED)
-For most of this project the `file_selftest` flakiness — guest mounts fine, then stalls/errors
-mid-I/O, worse on sustained transfers — was attributed to **HDV aperture *staleness*** ("snapshot
-semantics"). That diagnosis was **wrong**. Byte-level data-path instrumentation (June 2026,
-`VIRTIO_HDV_TRACE` + `VIRTIO_HDV_APERTURE_STATS`) traced the actual failure to a FUSE reply of
-**`-EIO`** that the guest surfaces as `ls: Invalid argument`, and the EIO to a descriptor buffer at
-GPA **`0x1_0269_1680`** (≈4.04 GiB) being **rejected before it ever reached the aperture path**
-(`bad_range=0`, zero aperture create failures across ~254 k ops).
-
-**Root cause.** Hyper-V splits guest RAM around the 32-bit MMIO hole: low RAM below ~3.75 GiB, the
-remainder **remapped to start at 4 GiB**. A 4 GiB guest therefore references DMA buffers at GPAs
-*above* 4 GiB. We set OpenVMM's `max_address` to the flat RAM size (`memory_mb · 1 MiB =
-0x1_0000_0000`), so every buffer landing in high RAM exceeded the ceiling and `guestmem` rejected it
-**upstream of our fallback** → the FUSE server returned `-EIO`. Flaky because only some allocations
-land high, and **sustained I/O is the most exposed** — which is exactly why it masqueraded as
-"staleness on large transfers."
-
-**Fix** (`crates/virtio-hdv/src/mem.rs`, `ram_size_to_max_gpa`): derive `max_address` from the RAM
-size as `4 GiB + ram_size`, a provably-safe upper bound that admits all real RAM for any low/high
-split (the high region is `ram − low < ram`, so its top is `< 4 GiB + ram`). Result: `file_selftest`
-passes reliably, **including 64 MiB transfers + 500 files** (sha256 write-through verified; ~750–970
-MB/s read, ~160–190 MB/s write), with a healthy on-demand aperture cache (~99.9 % hit rate, quota
-evict-and-retry exercised, zero failures).
-
-**What this retires.** The `PinBackingPages` (rejected `0xC037002E`) and `AllowOvercommit: false`
-(no help) experiments were chasing a backing-coherence problem that **did not exist**: those A/B
-failures were this ceiling bug, not snapshot semantics. The closed
-`HdvGuestMemoryEvictionWorker` is confirmed (by RE of both `vmdevicehost.dll` and
-`wsldevicehost.dll`, see `hdv-aperture-internals.md`) to be **quota/resource management, not a
-coherence-notification protocol** — there is no closed eviction notification to reverse-engineer.
-An HDV aperture is a direct `VidMapMemoryBlockPageRangeEx` of *backed* pages and is coherent; our
-on-demand per-range cache maps only backed pages and reuses them.
-
-**Residual / belt-and-suspenders.** `RearmNet` (5 ms MSI re-arm, `virtio-hdv/src/lib.rs`) and the
-boot-retry remain. They cover a *separate*, much rarer symptom (a fraction of boots stall on
-early-boot guest-memory apertures, and EVENT_IDX notification suppression); they are not proven
-necessary now and removing them is a follow-up spike, to be measured against `file_selftest`, not
-removed blind.
-
-- Refs: `crates/virtio-hdv/src/mem.rs` (`ram_size_to_max_gpa`, on-demand cache, instrumentation),
-  `virtio-hdv/src/lib.rs` (`RearmNet`), `docs/hdv-aperture-internals.md`; public HDV API at
-  learn.microsoft.com/virtualization/api/hcs/reference/hdv.
-
 ---
 
 ## shipped
 
 The verified record of what works. Each item is proven by tests and/or the design docs.
+
+- [x] **Logging / diagnostics via `tracing` + `hvfs_set_logger` wired.** Internal diagnostics
+  are structured `tracing` events (the `virtio-hdv` transport firehose under `VIRTIO_HDV_TRACE`,
+  the aperture-cache stats under `VIRTIO_HDV_APERTURE_STATS`, and the ABI lifecycle/error events).
+  `hvfs_set_logger` (previously a no-op stub) now installs a best-effort process-global subscriber
+  that fans both our events *and* the reused OpenVMM crates' events out to the caller's C callback
+  (syslog-level mapped) and, when a dev env var is set, to stderr — routing decided once, emitters
+  destination-agnostic (the OpenVMM convention; see `CLAUDE.md` "Logging & diagnostics"). Proven by
+  the offline delivery unit test (`set_logger_delivers_events_and_none_is_safe`) and verified live:
+  `attach_abi` with `VIRTIO_HDV_TRACE=1` routes the data-path firehose through `tracing` to stderr.
+  Refs: `crates/hyperv_virtiofs/src/logging.rs`, `crates/virtio-hdv/src/{mem.rs,ratelimit.rs}`.
+
+- [x] **Guest memory: the "aperture-coherence" flakiness was a `max_address` ceiling bug (fixed).**
+  The long-blamed `file_selftest` flakiness ("aperture snapshot staleness on sustained I/O") was a
+  misdiagnosis. Byte-level instrumentation traced it to a FUSE `-EIO` (guest: `ls: Invalid argument`)
+  from a descriptor buffer at GPA ≈4.04 GiB rejected **before** the aperture path ran. Root cause:
+  Hyper-V remaps RAM above the 4 GiB MMIO hole, but `max_address` was set to the flat RAM size, so
+  high-RAM DMA buffers exceeded the ceiling and `guestmem` rejected them. Fixed by deriving
+  `max_address = 4 GiB + ram_size` (`crates/virtio-hdv/src/mem.rs::ram_size_to_max_gpa`).
+  `file_selftest` now passes reliably incl. 64 MiB transfers (~99.9 % aperture-cache hit rate, zero
+  failures). RE of both `vmdevicehost.dll` and `wsldevicehost.dll` confirmed there is **no closed
+  coherence-notification protocol** to mirror — `HdvGuestMemoryEvictionWorker` is quota management;
+  an aperture is a direct `VidMapMemoryBlockPageRangeEx` of *backed* pages and is coherent. `RearmNet`
+  (5 ms MSI re-arm) + boot-retry remain as belt-and-suspenders for a rarer boot-stall/EVENT_IDX
+  window (removal is a measured follow-up, not blind). Full writeup: [`testing.md`](testing.md),
+  [`hdv-aperture-internals.md`](hdv-aperture-internals.md).
+
+- [x] **GUID assignment is settled (not caller-tunable, by design).** The device **instance** id is
+  caller-supplied over the C ABI (`hvfs_add_share`'s `instance_id`); the device **class** id is the
+  platform-mandated `VIRTIO_FS_DEVICE_CLASS_ID` (a *custom* class is refused for a 2nd virtio-fs
+  device — proven in the hotplug spike, `ERROR_HV_INVALID_PARAMETER`); the device-**host** id is a
+  per-process constant (`HVFS_DEVICE_HOST_ID`) and needs no caller override under Model A (separate
+  processes, below). So the earlier "caller-supplied class/host GUIDs" idea is retired — only the
+  instance id varies, which is exactly what lets N shares coexist on one host.
 
 - [x] **Concurrency / deployment model: one device host per process (Model A).** The DLL
   registers a device host in the calling process; the supported deployment runs each VM's

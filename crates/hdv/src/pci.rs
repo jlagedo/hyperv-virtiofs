@@ -31,10 +31,11 @@ const E_FAIL: sys::HRESULT = 0x8000_4005u32 as sys::HRESULT;
 /// map-key GUID must equal [`HVFS_DEVICE_INSTANCE_ID`] (the HDV `DeviceInstanceId`).
 /// Format them for the JSON document with [`guid_to_string`].
 ///
-// TODO(caller-guids): these are baked-in today, so only one such device can exist
-// per guest and a consumer can't avoid a collision. The tracked follow-up
-// (docs/roadmap.md, "Caller-supplied class / host GUIDs") is to let the host override
-// them, threading the ids through `attach`/`from_proxy`/`PciDevice::create`.
+// GUID assignment is settled, not open work (docs/roadmap.md, shipped): the device
+// **instance** id is caller-supplied over the C ABI; the **class** id must be the
+// platform-mandated `VIRTIO_FS_DEVICE_CLASS_ID` (a custom class is refused for a 2nd
+// virtio-fs device); and the device-**host** id is a per-process constant (Model A).
+// These `HVFS_*` constants remain as defaults used by tests and the pre-ABI paths.
 pub const HVFS_DEVICE_CLASS_ID: sys::GUID = sys::GUID {
     Data1: 0xa7e1_1e40,
     Data2: 0x0001,
@@ -389,9 +390,12 @@ impl PciDevice {
     /// so more than one such device can coexist in a guest — each needs a distinct
     /// instance id and a matching `FlexibleIov` slot (map-key == this id). The
     /// class id stays [`HVFS_DEVICE_CLASS_ID`].
-    // TODO(caller-guids): the class id (and the device-host id, in `proxy`) are
-    // still fixed constants; full override is tracked in docs/roadmap.md. The
-    // device-hotplug spike uses this to stand up two devices at once.
+    //
+    // The class id and device-host id are fixed by design, not pending work:
+    // virtio-fs must use the platform-mandated class (a custom one is refused for a
+    // 2nd device) and the device-host id is a per-process constant (Model A). Only
+    // the instance id varies — which is what the hotplug spike uses to stand up two
+    // devices at once. See docs/roadmap.md ("GUID assignment is settled").
     pub fn create_with_instance(
         host: DeviceHost,
         ops: Box<dyn PciOps>,

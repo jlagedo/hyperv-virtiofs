@@ -23,11 +23,10 @@
 //! [`VirtioFsDevice`]: virtiofs::virtio::VirtioFsDevice
 //! [`VirtioFs`]: virtiofs::VirtioFs
 
-#[macro_use]
-mod trace;
 mod handle;
 mod interrupt;
 mod mem;
+mod ratelimit;
 
 pub use handle::DeviceHandle;
 
@@ -317,44 +316,44 @@ impl PciOps for Ops {
 
     fn read_config(&self, offset: u32) -> u32 {
         let v = cfg_read(&mut self.dev.lock().unwrap(), offset as u16);
-        trace!("read_config off={offset:#x} -> {v:#010x}");
+        tracing::trace!("read_config off={offset:#x} -> {v:#010x}");
         v
     }
 
     fn write_config(&self, offset: u32, value: u32) {
-        trace!("write_config off={offset:#x} val={value:#010x}");
+        tracing::trace!("write_config off={offset:#x} val={value:#010x}");
         cfg_write(&mut self.dev.lock().unwrap(), offset as u16, value);
     }
 
     fn read_bar(&self, bar: u8, offset: u64, data: &mut [u8]) {
         let mut dev = self.dev.lock().unwrap();
         let Some(base) = bar_base(&mut dev, bar) else {
-            trace!(
+            tracing::trace!(
                 "read_bar bar={bar} off={offset:#x} len={} -> NO BAR BASE",
                 data.len()
             );
             data.fill(0xff);
             return;
         };
-        trace!(
+        tracing::trace!(
             "read_bar bar={bar} off={offset:#x} len={} addr={:#x}",
             data.len(),
             base + offset
         );
         match dev.mmio_read(base + offset, data) {
-            IoResult::Ok => trace!("  -> ok {data:02x?}"),
+            IoResult::Ok => tracing::trace!("  -> ok {data:02x?}"),
             IoResult::Err(e) => {
-                trace!("  -> err {e:?}");
+                tracing::trace!("  -> err {e:?}");
                 data.fill(0xff);
             }
             IoResult::Defer(token) => {
                 // Release the lock so the poll pump can complete this read.
                 drop(dev);
-                trace!("  -> defer, blocking…");
+                tracing::trace!("  -> defer, blocking…");
                 if block_on(token.read_future(data)).is_err() {
                     data.fill(0xff);
                 }
-                trace!("  -> defer done {data:02x?}");
+                tracing::trace!("  -> defer done {data:02x?}");
             }
         }
     }
@@ -362,10 +361,10 @@ impl PciOps for Ops {
     fn write_bar(&self, bar: u8, offset: u64, data: &[u8]) {
         let mut dev = self.dev.lock().unwrap();
         let Some(base) = bar_base(&mut dev, bar) else {
-            trace!("write_bar bar={bar} off={offset:#x} -> NO BAR BASE");
+            tracing::trace!("write_bar bar={bar} off={offset:#x} -> NO BAR BASE");
             return;
         };
-        trace!(
+        tracing::trace!(
             "write_bar bar={bar} off={offset:#x} addr={:#x} {data:02x?}",
             base + offset
         );
@@ -373,9 +372,9 @@ impl PciOps for Ops {
             IoResult::Ok | IoResult::Err(_) => {}
             IoResult::Defer(token) => {
                 drop(dev);
-                trace!("  -> defer, blocking…");
+                tracing::trace!("  -> defer, blocking…");
                 let _ = block_on(token.write_future());
-                trace!("  -> defer done");
+                tracing::trace!("  -> defer done");
             }
         }
     }

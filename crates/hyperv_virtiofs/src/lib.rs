@@ -34,6 +34,8 @@
 // The public type names mirror the C ABI (snake_case) on purpose.
 #![allow(non_camel_case_types)]
 
+mod logging;
+
 use hcs_sys::{
     HcsCloseComputeSystem, HcsCloseOperation, HcsCreateOperation, HcsModifyComputeSystem,
     HcsOpenComputeSystem, HcsWaitForOperationResult, GENERIC_ALL, HCS_SYSTEM,
@@ -77,6 +79,17 @@ thread_local! {
 fn set_last_error(msg: impl Into<Vec<u8>>) {
     let c = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(c));
+}
+
+/// Record a failure on both diagnostic channels at once and return its code: the
+/// thread-local [`hvfs_last_error`] string *and* a `tracing` error event (which
+/// reaches the [`hvfs_set_logger`] callback). Use this for genuine failures so the
+/// two channels never drift apart.
+fn fail(code: i32, msg: impl Into<String>) -> i32 {
+    let msg = msg.into();
+    tracing::error!(code, "{msg}");
+    set_last_error(msg);
+    code
 }
 
 /// Run an FFI body under `catch_unwind`, converting a panic into `HVFS_ERR_PANIC`
@@ -272,6 +285,7 @@ pub unsafe extern "C" fn hvfs_host_open(
     out: *mut *mut hvfs_host,
 ) -> i32 {
     guard(|| {
+        logging::init();
         if out.is_null() {
             set_last_error("null out parameter");
             return HVFS_ERR_INVALID_ARG;
@@ -301,11 +315,10 @@ pub unsafe extern "C" fn hvfs_host_open(
         // SAFETY: `idw` is a valid NUL-terminated wide string; `system` is a valid out ptr.
         let hr = unsafe { HcsOpenComputeSystem(idw.as_ptr(), GENERIC_ALL, &mut system) };
         if hr < 0 {
-            set_last_error(format!(
-                "HcsOpenComputeSystem failed: HRESULT {:#010x}",
-                hr as u32
-            ));
-            return HVFS_ERR_HDV;
+            return fail(
+                HVFS_ERR_HDV,
+                format!("HcsOpenComputeSystem failed: HRESULT {:#010x}", hr as u32),
+            );
         }
         let owned = OwnedSystem(system);
 
@@ -318,8 +331,10 @@ pub unsafe extern "C" fn hvfs_host_open(
             match unsafe { DeviceHost::from_proxy(&HVFS_DEVICE_HOST_ID, support.as_iunknown()) } {
                 Ok(h) => h,
                 Err(e) => {
-                    set_last_error(format!("HdvInitializeDeviceHostForProxy failed: {e}"));
-                    return HVFS_ERR_HDV;
+                    return fail(
+                        HVFS_ERR_HDV,
+                        format!("HdvInitializeDeviceHostForProxy failed: {e}"),
+                    );
                 }
             };
 
@@ -330,6 +345,7 @@ pub unsafe extern "C" fn hvfs_host_open(
             owned,
             memory_bytes: cfg.memory_mb.saturating_mul(1024 * 1024),
         });
+        tracing::info!(system = %id, memory_mb = cfg.memory_mb, "device host registered");
         // SAFETY: `out` checked non-null above and guaranteed writable by the caller.
         unsafe { *out = Box::into_raw(h) };
         HVFS_OK
@@ -356,6 +372,7 @@ pub unsafe extern "C" fn hvfs_add_share(
     out: *mut *mut hvfs_share,
 ) -> i32 {
     guard(|| {
+        logging::init();
         if out.is_null() {
             set_last_error("null out parameter");
             return HVFS_ERR_INVALID_ARG;
@@ -413,8 +430,7 @@ pub unsafe extern "C" fn hvfs_add_share(
         ) {
             Ok(d) => d,
             Err(e) => {
-                set_last_error(format!("attach virtio-fs over HDV: {e}"));
-                return HVFS_ERR_HDV;
+                return fail(HVFS_ERR_HDV, format!("attach virtio-fs over HDV: {e}"));
             }
         };
 
@@ -424,13 +440,16 @@ pub unsafe extern "C" fn hvfs_add_share(
         if let Err(hr) = unsafe { hcs_modify(h.system(), &req) } {
             // The Add failed; drop the device we just created (host-side cleanup).
             drop(device);
-            set_last_error(format!(
-                "HcsModifyComputeSystem Add FlexibleIov: HRESULT {:#010x}",
-                hr as u32
-            ));
-            return HVFS_ERR_HDV;
+            return fail(
+                HVFS_ERR_HDV,
+                format!(
+                    "HcsModifyComputeSystem Add FlexibleIov: HRESULT {:#010x}",
+                    hr as u32
+                ),
+            );
         }
 
+        tracing::info!(tag = %cfg.tag, instance_id = %instance_str, "share added");
         let share = Box::new(hvfs_share {
             _device: device,
             system: h.system(),
@@ -478,33 +497,34 @@ pub unsafe extern "C" fn hvfs_share_instance_id(share: *const hvfs_share) -> *co
 #[no_mangle]
 pub unsafe extern "C" fn hvfs_remove_share(share: *mut hvfs_share) -> i32 {
     guard(|| {
+        logging::init();
         if share.is_null() {
             return HVFS_OK;
         }
         // SAFETY: caller contract — live handle, host still open.
         let s = unsafe { &*share };
-        let req = slot_request(
-            "Remove",
-            &s.instance_id.to_string_lossy(),
-            &s.emulator_id.to_string_lossy(),
-        );
+        let instance = s.instance_id.to_string_lossy().into_owned();
+        let req = slot_request("Remove", &instance, &s.emulator_id.to_string_lossy());
         // SAFETY: the share borrows a system handle live while its host is open.
         let outcome = match unsafe { hcs_modify(s.system, &req) } {
-            Ok(()) => HVFS_OK,
+            Ok(()) => {
+                tracing::info!(instance_id = %instance, "share removed");
+                HVFS_OK
+            }
             Err(hr) if hr == HRESULT_NOT_SUPPORTED => {
-                set_last_error(
-                    "FlexibleIov live Remove unsupported on this Windows; \
-                     device reclaimed when the compute system is torn down",
-                );
+                let msg = "FlexibleIov live Remove unsupported on this Windows; \
+                     device reclaimed when the compute system is torn down";
+                tracing::warn!(instance_id = %instance, "{msg}");
+                set_last_error(msg);
                 HVFS_ERR_UNSUPPORTED
             }
-            Err(hr) => {
-                set_last_error(format!(
+            Err(hr) => fail(
+                HVFS_ERR_HDV,
+                format!(
                     "HcsModifyComputeSystem Remove FlexibleIov: HRESULT {:#010x}",
                     hr as u32
-                ));
-                HVFS_ERR_HDV
-            }
+                ),
+            ),
         };
 
         // Only free on success/unsupported; a genuine error leaves the handle valid.
@@ -534,6 +554,7 @@ pub unsafe extern "C" fn hvfs_remove_share(share: *mut hvfs_share) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn hvfs_host_close(host: *mut hvfs_host) -> i32 {
     guard(|| {
+        logging::init();
         if host.is_null() {
             return HVFS_OK;
         }
@@ -541,6 +562,7 @@ pub unsafe extern "C" fn hvfs_host_close(host: *mut hvfs_host) -> i32 {
         let h = unsafe { Box::from_raw(host) };
         // Free any shares the caller didn't remove (drops their HDV device handles).
         if let Ok(mut v) = h.shares.lock() {
+            tracing::info!(reclaimed_shares = v.len(), "closing device host");
             for p in v.drain(..) {
                 if !p.is_null() {
                     // SAFETY: each `p` is a live hvfs_share from hvfs_add_share, freed once.
@@ -569,16 +591,29 @@ pub extern "C" fn hvfs_last_error() -> *const c_char {
 /// Logger callback: `(level, message, ctx)`. `level` follows syslog severities.
 pub type hvfs_log_fn = Option<extern "C" fn(level: c_int, msg: *const c_char, ctx: *mut c_void)>;
 
-/// Install a process-global logger. Set once at load, before [`hvfs_host_open`].
+/// Install a process-global logger. Call once at load, ideally before
+/// [`hvfs_host_open`]. `cb` receives `(level, message, ctx)`: `level` is a syslog
+/// severity (3=err, 4=warning, 6=info, 7=debug/trace); `message` is a borrowed,
+/// NUL-terminated string valid only for the duration of the call; `ctx` is returned
+/// verbatim. The logger receives both this DLL's own events and the underlying
+/// OpenVMM device-host stream. `cb = NULL` disables delivery.
+///
+/// Best-effort: the DLL installs a process-global log subscriber only if the host
+/// process hasn't already installed one. If it has, the host owns routing and the
+/// callback may receive nothing. Verbosity follows `RUST_LOG` (default: info).
 ///
 /// # Safety
 /// `cb` must remain a valid function pointer for the process lifetime; `ctx` is
 /// passed back verbatim and must outlive any logging.
 #[no_mangle]
 pub unsafe extern "C" fn hvfs_set_logger(cb: hvfs_log_fn, ctx: *mut c_void) {
-    // TODO: store cb/ctx in a global and route the device-host log stream to it.
-    // No-op stub today; tracked in docs/roadmap.md ("Wire hvfs_set_logger").
-    let _ = (cb, ctx);
+    // Store the sink, then ensure the process-global subscriber is installed so
+    // both our events and the reused OpenVMM crates' events reach the callback.
+    // Wrapped in catch_unwind to honor the no-panic-across-the-boundary contract.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        logging::set_sink(cb, ctx);
+        logging::init();
+    }));
 }
 
 #[cfg(test)]
@@ -779,10 +814,36 @@ mod tests {
         assert_eq!(unsafe { hvfs_host_close(ptr::null_mut()) }, HVFS_OK);
     }
 
+    // ---- hvfs_set_logger: events reach the callback, null is safe --------------
+    // The callback records into the `AtomicUsize` handed to it via `ctx`, which
+    // also exercises the opaque-context plumbing. Note tracing's global subscriber
+    // is process-wide and set-once: other tests calling `init()` is fine (the
+    // sink is read live), and this is the only test that mutates the sink.
+    extern "C" fn counting_cb(_level: c_int, msg: *const c_char, ctx: *mut c_void) {
+        if msg.is_null() || ctx.is_null() {
+            return;
+        }
+        // SAFETY: `ctx` is the `&AtomicUsize` passed below, valid for the call.
+        let counter = unsafe { &*(ctx as *const std::sync::atomic::AtomicUsize) };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[test]
-    fn set_logger_stub_does_not_crash() {
-        // SAFETY: the stub ignores both arguments today.
+    fn set_logger_delivers_events_and_none_is_safe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = AtomicUsize::new(0);
+        // SAFETY: `&hits` outlives the window in which the callback is installed
+        // (we clear the sink before `hits` is dropped at end of scope).
+        unsafe { hvfs_set_logger(Some(counting_cb), &hits as *const _ as *mut c_void) };
+        tracing::error!(marker = "unit-test", "delivery probe");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "the installed callback should have received the event"
+        );
+        // A null callback disables delivery and must not crash.
+        // SAFETY: null callback is an explicitly allowed input.
         unsafe { hvfs_set_logger(None, ptr::null_mut()) };
+        tracing::error!("after-none must not reach a callback");
     }
 
     #[test]

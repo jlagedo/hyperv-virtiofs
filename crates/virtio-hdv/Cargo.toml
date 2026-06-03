@@ -26,3 +26,8 @@ inspect.workspace = true
 # block_on for resolving the device's deferred config reads on the synchronous
 # HDV callback thread (the device task completes them from the pool thread).
 futures = "0.3"
+
+# Structured diagnostics. We emit `tracing` events (the transport firehose + the
+# aperture-cache stats); the hyperv_virtiofs cdylib installs the subscriber that
+# routes them. See CLAUDE.md "Logging & diagnostics".
+tracing.workspace = true

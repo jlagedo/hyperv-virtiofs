@@ -39,13 +39,17 @@
 //! aperture failures. Genuine map-time coherence (map only *backed* pages, reuse)
 //! still matters and is what this cache provides; it is no longer the bottleneck.
 //!
-//! **Instrumentation.** Set `VIRTIO_HDV_APERTURE_STATS=1` for a one-line cache
-//! summary (ops/hits/creates/evicts/quota_retries/create_fails/bad_range/not_bound/
-//! live/peak_live/max_span) emitted by op-count *or* wall-clock — so even a stalled
-//! run emits — plus a logged line per `HdvCreateGuestMemoryAperture` failure and per
-//! out-of-`max_address` access. `VIRTIO_HDV_TRACE=1` adds the per-access firehose,
-//! including byte dumps of small (≤64 B) guest reads/writes (rings, descriptors,
-//! FUSE headers) — the tool that pinned down the EIO above.
+//! **Instrumentation.** All diagnostics here are `tracing` events, routed by the
+//! subscriber the `hyperv_virtiofs` cdylib installs (to the `hvfs_set_logger`
+//! callback and/or stderr — see that crate's `logging` module). `VIRTIO_HDV_APERTURE_STATS=1`
+//! enables the cache-stats event (DEBUG, target `virtio_hdv::aperture`:
+//! ops/hits/creates/evicts/quota_retries/create_fails/bad_range/not_bound/live/
+//! peak_live/max_span), emitted by op-count *or* wall-clock so even a stalled run
+//! emits; aperture-create failures and out-of-`max_address` accesses are
+//! rate-limited WARNs (guest-triggerable). `VIRTIO_HDV_TRACE=1` raises this crate to
+//! TRACE for the per-access firehose, including byte dumps of small (≤64 B) guest
+//! reads/writes (rings, descriptors, FUSE headers) — the tool that pinned down the
+//! EIO above.
 //!
 //! [`GuestMemory`]: guestmem::GuestMemory
 
@@ -107,22 +111,25 @@ impl Stats {
         self.peak_live.fetch_max(n, Relaxed);
     }
 
-    fn summary(&self) -> String {
-        format!(
-            "aperture-stats: ops={} hits={} creates={} evicts={} quota_retries={} \
-             create_fails={} bad_range={} not_bound={} live={} peak_live={} max_span={:#x}",
-            self.ops.load(Relaxed),
-            self.hits.load(Relaxed),
-            self.creates.load(Relaxed),
-            self.evicts.load(Relaxed),
-            self.quota_retries.load(Relaxed),
-            self.create_fails.load(Relaxed),
-            self.bad_range.load(Relaxed),
-            self.not_bound.load(Relaxed),
-            self.live.load(Relaxed),
-            self.peak_live.load(Relaxed),
-            self.max_span.load(Relaxed),
-        )
+    /// Emit the counters as one structured `tracing` event (DEBUG, target
+    /// `virtio_hdv::aperture`). `phase` is `"periodic"` or `"final"`.
+    fn emit(&self, phase: &'static str) {
+        tracing::debug!(
+            target: "virtio_hdv::aperture",
+            phase,
+            ops = self.ops.load(Relaxed),
+            hits = self.hits.load(Relaxed),
+            creates = self.creates.load(Relaxed),
+            evicts = self.evicts.load(Relaxed),
+            quota_retries = self.quota_retries.load(Relaxed),
+            create_fails = self.create_fails.load(Relaxed),
+            bad_range = self.bad_range.load(Relaxed),
+            not_bound = self.not_bound.load(Relaxed),
+            live = self.live.load(Relaxed),
+            peak_live = self.peak_live.load(Relaxed),
+            max_span = self.max_span.load(Relaxed),
+            "aperture stats"
+        );
     }
 }
 
@@ -176,14 +183,15 @@ impl Cache {
                         || evictions >= MAX_ENTRIES
                     {
                         stats.create_fails.fetch_add(1, Relaxed);
-                        if stats_on() {
-                            eprintln!(
-                                "[virtio-hdv] aperture create FAILED gpa={base:#x} len={len:#x} \
-                                 live={} HRESULT {:#010x}",
-                                self.map.len(),
-                                e.0 as u32
-                            );
-                        }
+                        // Guest-triggerable (e.g. a descriptor into an unbacked range),
+                        // so rate-limit it. hresult is structured for grepping.
+                        crate::ratelimit::warn_ratelimited!(
+                            gpa = base,
+                            len,
+                            live = self.map.len(),
+                            hresult = e.0 as u32,
+                            "HdvCreateGuestMemoryAperture failed"
+                        );
                         return Err(GuestMemoryBackingError::other(
                             err_addr,
                             ApertureFailed(e.0),
@@ -299,7 +307,7 @@ impl HdvApertureMem {
                     .is_ok()
         };
         if due_by_ops || due_by_time {
-            eprintln!("[virtio-hdv] {}", self.stats.summary());
+            self.stats.emit("periodic");
         }
     }
 
@@ -323,13 +331,14 @@ impl HdvApertureMem {
         })?;
         if end > self.max_address {
             self.stats.bad_range.fetch_add(1, Relaxed);
-            if stats_on() {
-                eprintln!(
-                    "[virtio-hdv] BAD_RANGE gpa={addr:#x} len={len} end={end:#x} \
-                     max_address={:#x}",
-                    self.max_address
-                );
-            }
+            // Guest-triggerable (a descriptor past guest RAM), so rate-limit it.
+            crate::ratelimit::warn_ratelimited!(
+                gpa = addr,
+                len,
+                end,
+                max_address = self.max_address,
+                "guest access exceeds max_address"
+            );
             return Err(GuestMemoryBackingError::other(addr, BadRange));
         }
 
@@ -357,7 +366,7 @@ impl HdvApertureMem {
 impl Drop for HdvApertureMem {
     fn drop(&mut self) {
         if stats_on() {
-            eprintln!("[virtio-hdv] FINAL {}", self.stats.summary());
+            self.stats.emit("final");
         }
     }
 }
@@ -424,17 +433,17 @@ unsafe impl GuestMemoryAccess for HdvApertureMem {
                 // Dump the bytes of *small* reads (rings, descriptors, FUSE headers)
                 // so a stale/incoherent control read is visible as wrong content —
                 // e.g. an avail.idx that never advances despite guest kicks.
-                if crate::trace::on() && len <= 64 {
+                if len <= 64 && tracing::enabled!(tracing::Level::TRACE) {
                     // SAFETY: we just filled `dest[..len]`; reading it back is sound.
                     let bytes = unsafe { std::slice::from_raw_parts(dest, len) };
-                    crate::trace::trace!("read_guest gpa={addr:#x} len={len} ok {bytes:02x?}");
+                    tracing::trace!("read_guest gpa={addr:#x} len={len} ok {bytes:02x?}");
                 } else {
-                    crate::trace::trace!("read_guest gpa={addr:#x} len={len} ok");
+                    tracing::trace!("read_guest gpa={addr:#x} len={len} ok");
                 }
             }
             // The failure kind (bad_range / not_bound / create_fails) is already
             // counted at its source in `with_mapping`; just trace here.
-            Err(e) => crate::trace::trace!("read_guest gpa={addr:#x} len={len} FAILED: {e:?}"),
+            Err(e) => tracing::trace!("read_guest gpa={addr:#x} len={len} FAILED: {e:?}"),
         }
         r
     }
@@ -452,15 +461,15 @@ unsafe impl GuestMemoryAccess for HdvApertureMem {
         });
         match &r {
             Ok(()) => {
-                if crate::trace::on() && len <= 64 {
+                if len <= 64 && tracing::enabled!(tracing::Level::TRACE) {
                     // SAFETY: `src[..len]` is valid for read per the caller's contract.
                     let bytes = unsafe { std::slice::from_raw_parts(src, len) };
-                    crate::trace::trace!("write_guest gpa={addr:#x} len={len} ok {bytes:02x?}");
+                    tracing::trace!("write_guest gpa={addr:#x} len={len} ok {bytes:02x?}");
                 } else {
-                    crate::trace::trace!("write_guest gpa={addr:#x} len={len} ok");
+                    tracing::trace!("write_guest gpa={addr:#x} len={len} ok");
                 }
             }
-            Err(e) => crate::trace::trace!("write_guest gpa={addr:#x} len={len} FAILED: {e:?}"),
+            Err(e) => tracing::trace!("write_guest gpa={addr:#x} len={len} FAILED: {e:?}"),
         }
         r
     }

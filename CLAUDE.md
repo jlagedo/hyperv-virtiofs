@@ -70,7 +70,7 @@ Test ladder (each proves one more layer; `docs/` has the design notes):
 - `hotplug.rs` — hot-add a device-per-share to an *already-running* VM (`docs/hotplug-spike.md`).
 - `attach_abi.rs` — the shipped front door: drives the exported C functions end-to-end (the authoritative ABI proof).
 - `edge_cases.rs` — the C ABI rejects bad share input (`ro`/GUID/JSON/null) against a *live* host; needs only a created (not started) VM, so it's fast.
-- `file_selftest.rs` — **green-ladder rung**: data-path integrity + throughput over virtio-fs — multi-MiB write-through integrity (host recomputes the guest's sha256), MB/s, many-files, unicode/nested names, via the guest's opt-in `atelier.fileperf` self-test in `test/guest/init`. Long mislabelled "best-effort" under an "aperture-coherence limitation"; that was a `max_address` high-RAM ceiling bug (Hyper-V remaps RAM above 4 GiB), now fixed — passes reliably incl. 64 MiB transfers (`docs/testing.md`, `crates/virtio-hdv/src/mem.rs` `ram_size_to_max_gpa`).
+- `file_selftest.rs` — **green-ladder rung**: data-path integrity + throughput over virtio-fs — multi-MiB write-through integrity (host recomputes the guest's sha256), MB/s, many-files, unicode/nested names, via the guest's opt-in `atelier.fileperf` self-test in `test/guest/init`. Covers up to 64 MiB transfers (`docs/testing.md`).
 - `concurrent_processes.rs` — **Model A** proof: two `host_child` processes, each its own device host + VM, hot-add a share and mount concurrently. The supported deployment is **one device host per process** (see `docs/share-abi.md`); driving multiple hosts in one process is out of scope (the in-process proxy path races — `from_proxy` → `0x80070005`).
 - `attach.rs` / `attach_oop.rs` — **negative spikes**: they assert success and so *fail by
   design* on current Windows, standing as reproductions of why the proxy path is required.
@@ -139,16 +139,34 @@ machinery, and FUSE server are **reused** (pinned git deps), not reimplemented.
   devices tear down before the device host, before the COM support object, before the HCS
   handle closes.
 
+## Logging & diagnostics (the pattern to follow)
+
+Follow OpenVMM's convention — **structured `tracing`, never ad-hoc prints, and the emitter
+never decides the destination**:
+
+- **Emit with `tracing` macros**, not `println!`/`eprintln!`: `tracing::info!/warn!/error!/
+  debug!/trace!` with **key-value fields**, not pre-formatted strings — e.g.
+  `tracing::warn!(gpa, len, "aperture map failed")`.
+- **Rate-limit anything a guest can trigger repeatedly** so it can't spam the log — use the
+  local `crate::ratelimit::warn_ratelimited!` in `virtio-hdv` (our stand-in for OpenVMM's
+  `tracelimit`). Bare `tracing::warn!` is for one-shot/host-side events.
+- **`println!`/`eprintln!` is only for**: user-facing CLI/program output, `build.rs` cargo
+  directives, dev tooling, and tests (e.g. `hcs-testvm`). **Never** as the logging mechanism
+  for library/runtime code.
+- **Routing is a separate concern, set once.** Call sites only emit; *where* logs go is
+  decided by the `tracing_subscriber` the `hyperv_virtiofs` cdylib installs
+  (`crates/hyperv_virtiofs/src/logging.rs`): the `hvfs_set_logger` C callback, and stderr
+  when a dev env var is set (`VIRTIO_HDV_TRACE` firehose, `VIRTIO_HDV_APERTURE_STATS` cache
+  stats; otherwise `RUST_LOG`, default info). Adding a sink never touches a call site.
+
 ## Known platform constraints
 
 - Live share **removal** is platform-blocked (`FlexibleIov` Remove returns
   `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` = `0x80070032`); reclaim happens at teardown.
 - No DAX yet: `shmem_size = 0`, so no shared-memory BAR. Guest memory is reached via an
   **on-demand per-range aperture cache** (`crates/virtio-hdv/src/mem.rs`); `max_address` is
-  derived as `4 GiB + ram_size` to admit RAM remapped above the 4 GiB MMIO hole (`ram_size_to_max_gpa`
-  — the fix for the former "aperture-coherence limitation"). An interrupt re-arm net + boot retry
-  remain as belt-and-suspenders for a rarer boot-stall/EVENT_IDX window.
-- `hvfs_set_logger` is a no-op stub today.
+  derived as `4 GiB + ram_size` (`ram_size_to_max_gpa`) to admit RAM remapped above the 4 GiB
+  MMIO hole. An interrupt re-arm net + boot retry guard a rarer boot-stall/EVENT_IDX window.
 - **One device host per process (Model A).** The DLL registers a device host in the calling
   process; the supported deployment runs each VM's device host in its own process (as WSL
   does). Registering multiple device hosts in one process is unsupported — the in-process
@@ -157,5 +175,5 @@ machinery, and FUSE server are **reused** (pinned git deps), not reimplemented.
   multi-host-per-process safety the platform's teardown/IPC/aperture paths don't give us).
   See `docs/share-abi.md` ("Deployment model").
 
-Open work (live removal, `ro` enforcement, caller-supplied GUIDs, logger wiring, coherent
-guest memory) is tracked in `docs/roadmap.md`.
+Open work (live removal, `ro` enforcement, self-hosted e2e CI) is tracked in
+`docs/roadmap.md`.
