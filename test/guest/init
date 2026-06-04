@@ -139,6 +139,99 @@ run_selftest() {
   echo "================ SELFTEST_DONE tag=$t ================"
 }
 
+# --- Performance baseline benchmark (opt-in: `atelier.perfbench`) -----------------
+# A dedicated micro-benchmark to characterise the data path BEFORE optimisation work,
+# so we have numbers to compare against. Unlike run_selftest (a warm, integrity-first
+# check), this DELIBERATELY drops caches to measure the real device path, sweeps block
+# sizes, and separates data throughput from metadata cost — the two axes that decide
+# where optimisation pays off. Pair with host-side VIRTIO_HDV_APERTURE_STATS=1 to see
+# the aperture cache hit-rate / evictions under each phase.
+#
+# Sentinels (perf_baseline.rs parses these):
+#   PB_ENV ...                            run parameters
+#   PB_SEQWRITE bs=.. MBps=.. ms=..       sequential write (fsync'd, real traffic)
+#   PB_SEQREAD_COLD bs=.. MBps=.. ms=..   sequential read after drop_caches (device path)
+#   PB_SEQREAD_WARM bs=.. MBps=..         sequential read from guest page cache (ref)
+#   PB_RANDREAD bs=4k iops=.. MBps=..     random cold 4k reads (aperture churn)
+#   PB_META_CREATE n=.. ops=.. ms=..      create N small files
+#   PB_META_STAT   n=.. ops=..            stat   N small files (cold)
+#   PB_META_READDIR n=.. ms=..            list the directory
+#   PB_META_DELETE n=.. ops=..            unlink N small files
+#   PERFBENCH_DONE tag=<t>                benchmark finished (test waits on this)
+drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; }
+# MB/s (decimal) from a byte count and an elapsed-ms value; 0 if not measurable.
+mbps() { [ "$2" -gt 0 ] 2>/dev/null && echo $(( $1 / 1000 / $2 )) || echo 0; }
+# ops/sec from a count and an elapsed-ms value.
+opss() { [ "$2" -gt 0 ] 2>/dev/null && echo $(( $1 * 1000 / $2 )) || echo 0; }
+
+run_perfbench() {
+  t="$1"; mp="$2"
+  echo "================ PERFBENCH_BEGIN tag=$t ================"
+  seqmb=$(sed -n 's/.*atelier\.pb_seqmb=\([0-9]*\).*/\1/p' /proc/cmdline); [ -n "$seqmb" ] || seqmb=64
+  meta=$(sed -n 's/.*atelier\.pb_meta=\([0-9]*\).*/\1/p' /proc/cmdline);   [ -n "$meta" ]  || meta=1000
+  rnd=$(sed -n 's/.*atelier\.pb_rand=\([0-9]*\).*/\1/p' /proc/cmdline);    [ -n "$rnd" ]   || rnd=300
+  echo "PB_ENV tag=$t seqmb=$seqmb meta=$meta rand=$rnd kernel=$(uname -r)"
+  bytes=$(( seqmb * 1024 * 1024 ))
+  f="$mp/pb_seq.bin"
+
+  # (1) Sequential WRITE, fsync'd — real queue+aperture+host-write traffic. Two block
+  #     sizes: 1M (throughput-bound) and 4k (per-request-overhead-bound).
+  for bs in 1M 4k; do
+    case "$bs" in 1M) cnt=$seqmb;; 4k) cnt=$(( seqmb * 256 ));; esac
+    drop_caches
+    t0=$(date +%s%N); dd if=/dev/zero of="$f" bs="$bs" count="$cnt" conv=fsync 2>/dev/null; t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    echo "PB_SEQWRITE bs=$bs bytes=$bytes ms=$ms MBps=$(mbps "$bytes" "$ms")"
+  done
+
+  # (2) Sequential READ, CACHE-COLD — drop_caches forces the device to re-fetch every
+  #     page, so this is the true read-path rate (and the aperture-churn worst case).
+  for bs in 1M 4k; do
+    drop_caches
+    t0=$(date +%s%N); dd if="$f" of=/dev/null bs="$bs" 2>/dev/null; t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    echo "PB_SEQREAD_COLD bs=$bs bytes=$bytes ms=$ms MBps=$(mbps "$bytes" "$ms")"
+  done
+
+  # (3) Sequential READ, WARM — straight from guest page cache; the gap to COLD shows how
+  #     much the device path actually costs (and bounds what DAX could remove).
+  t0=$(date +%s%N); dd if="$f" of=/dev/null bs=1M 2>/dev/null; t1=$(date +%s%N)
+  ms=$(( (t1 - t0) / 1000000 ))
+  echo "PB_SEQREAD_WARM bs=1M bytes=$bytes ms=$ms MBps=$(mbps "$bytes" "$ms")"
+
+  # (4) Random COLD 4k reads — scattered single-page fetches stress the aperture cache's
+  #     reuse/eviction the most (each read a distinct page after drop_caches).
+  maxblk=$(( bytes / 4096 )); rbytes=$(( rnd * 4096 ))
+  drop_caches
+  t0=$(date +%s%N)
+  i=0; while [ "$i" -lt "$rnd" ]; do
+    blk=$(( (RANDOM * 32768 + RANDOM) % maxblk ))
+    dd if="$f" of=/dev/null bs=4k count=1 skip="$blk" 2>/dev/null
+    i=$(( i + 1 ))
+  done
+  t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+  echo "PB_RANDREAD bs=4k n=$rnd bytes=$rbytes ms=$ms iops=$(opss "$rnd" "$ms") MBps=$(mbps "$rbytes" "$ms")"
+  rm -f "$f"
+
+  # (5) Metadata — each phase is a separate FUSE round-trip storm; this is the cost DAX
+  #     does NOT help (and the single-threaded executor serialises). Create / stat-cold /
+  #     readdir / delete, reported as ops/sec.
+  md="$mp/pb_meta"; rm -rf "$md"; mkdir -p "$md"
+  t0=$(date +%s%N); i=0; while [ "$i" -lt "$meta" ]; do echo x > "$md/f_$i"; i=$(( i + 1 )); done; sync; t1=$(date +%s%N)
+  ms=$(( (t1 - t0) / 1000000 )); echo "PB_META_CREATE n=$meta ms=$ms ops=$(opss "$meta" "$ms")"
+  drop_caches
+  t0=$(date +%s%N); i=0; while [ "$i" -lt "$meta" ]; do stat "$md/f_$i" >/dev/null 2>&1; i=$(( i + 1 )); done; t1=$(date +%s%N)
+  ms=$(( (t1 - t0) / 1000000 )); echo "PB_META_STAT n=$meta ms=$ms ops=$(opss "$meta" "$ms")"
+  drop_caches
+  t0=$(date +%s%N); cnt=$(ls -1 "$md" | wc -l); t1=$(date +%s%N)
+  ms=$(( (t1 - t0) / 1000000 )); echo "PB_META_READDIR n=$cnt ms=$ms"
+  t0=$(date +%s%N); i=0; while [ "$i" -lt "$meta" ]; do rm -f "$md/f_$i"; i=$(( i + 1 )); done; sync; t1=$(date +%s%N)
+  ms=$(( (t1 - t0) / 1000000 )); echo "PB_META_DELETE n=$meta ms=$ms ops=$(opss "$meta" "$ms")"
+  rm -rf "$md"
+
+  echo "================ PERFBENCH_DONE tag=$t ================"
+}
+
 # --- VPCI device-hotplug watch loop (device-per-share spike, docs/hotplug-spike.md) ---
 # The host hot-adds/removes a virtio-fs *device* per share on the running VM. We can't
 # read a freshly-bound device's tag reliably from sysfs across kernels, so we mount by
@@ -171,6 +264,7 @@ while [ "$i" -lt 300 ]; do
       ls -la "$mp" 2>&1 | head -5
       cat "$mp/SENTINEL.txt" 2>/dev/null
       if grep -q 'atelier\.fileperf' /proc/cmdline; then run_selftest "$t" "$mp"; fi
+      if grep -q 'atelier\.perfbench' /proc/cmdline; then run_perfbench "$t" "$mp"; fi
     fi
   done
   i=$((i + 1))

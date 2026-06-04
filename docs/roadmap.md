@@ -1,15 +1,14 @@
 # Roadmap
 
-**The single source of truth for status** — what's already **shipped** (bottom) and
-everything left to spike, confirm, or develop. If a capability is unfinished, blocked, or
-unverified, it is tracked here — not scattered across the README, the spike notes, or code
-TODOs. Those carry at most a one-line pointer back to this file. Design and record detail for
-shipped work lives in the design docs ([`share-abi.md`](share-abi.md),
-[`hotplug-spike.md`](hotplug-spike.md), [`hdv-proxy-abi.md`](hdv-proxy-abi.md)).
+**The single source of truth for status** — everything left to spike, confirm, or develop.
+If a capability is unfinished, blocked, or unverified, it is tracked here — not scattered
+across the README, the spike notes, or code TODOs. Those carry at most a one-line pointer
+back to this file. Design and record detail for shipped work lives in the design docs
+([`share-abi.md`](share-abi.md), [`hotplug-spike.md`](hotplug-spike.md),
+[`hdv-proxy-abi.md`](hdv-proxy-abi.md)).
 
 Each open item is tagged by the kind of work remaining:
 - **develop** — the path is understood; it needs building.
-- **confirm** — built or believed, but unverified on a wider matrix; needs a measurement.
 - **blocked** — the platform refuses it today; tracked so we revisit when that changes.
 
 ---
@@ -26,22 +25,14 @@ devices at VM shutdown via a kill-on-close job object.
 - **Behaviour today (honest):** the DLL returns `HVFS_ERR_UNSUPPORTED`, releases host-side resources,
   and de-registers the share; the **guest device lingers until the compute system is torn down**
   (reclaim-at-recycle). The caller (e.g. atelier's `atelierd`) owns the recycle policy.
-- **Revisit when:** the platform adds hot-remove for FlexibleIov-class devices.
+- **Revisit when:** the platform adds hot-remove for FlexibleIov-class devices. WSL's "not all
+  versions of Windows support it" implies **some** builds may allow FlexibleIov Remove, so before
+  designing around the blocker permanently it's worth measuring: run the Remove path on other host
+  builds (Win10 `{2,3}` vs Win11 `{2,7}`) and record which, if any, return `HVFS_OK` with the guest
+  device actually disappearing. If a supported build turns up, this item moves from **blocked** to
+  **develop**.
 - Refs: `hvfs_remove_share` (`crates/hyperv_virtiofs/src/lib.rs`), the spike's Stage 3 +
   support-matrix analysis ([`hotplug-spike.md`](hotplug-spike.md)).
-
----
-
-## confirm
-
-### Re-test live removal across the Windows support matrix
-WSL's "not all versions of Windows support it" implies **some** builds do allow FlexibleIov Remove.
-Before designing around the blocker permanently, measure it: run the Remove path on other Windows
-host builds (and Win10 `{2,3}` vs Win11 `{2,7}`) and record which, if any, return `HVFS_OK`. If a
-supported build exists, "Live share removal" above moves from **blocked** to **develop**.
-
-- Verification: `hvfs_remove_share` returning `HVFS_OK` (not `HVFS_ERR_UNSUPPORTED`) on some build,
-  with the guest device actually disappearing.
 
 ---
 
@@ -65,78 +56,35 @@ documented, on-demand check; only the build/lint/unit gates are automated.
 
 - Refs: [`testing.md`](testing.md), `.github/workflows/ci.yml`, `test/run-e2e.ps1`.
 
----
+### DAX window (`shmem_size > 0`) — *nice-to-have, performance only*
+Today `shmem_size = 0`: all I/O is FUSE-over-virtqueue, with guest DMA serviced by the on-demand
+aperture cache (`crates/virtio-hdv/src/mem.rs`). DAX instead maps host page-cache pages **directly
+into a guest BAR4 window** (virtio-fs shared-memory region, driven by `FUSE_SETUPMAPPING`), so the
+guest loads/stores against host memory — zero-copy, coherent `mmap`, no per-I/O VMEXIT, no
+double-caching. The HDV plumbing exists and is proven: `HdvCreate/DestroySectionBackedMmioRange`
+(device-host exports, used by `wsldevicehost.dll`); wiring is an HDV `MemoryMapper` passed as
+`shared_mem_mapper` + `shmem_size > 0`.
 
-## shipped
+**Not** a WSL-parity gap — WSL's file shares are non-DAX too (its section-backed MMIO path serves
+only the WSLg shared-memory device). This is going *beyond* WSL, for bulk-data/`mmap` workloads.
 
-The verified record of what works. Each item is proven by tests and/or the design docs.
+Limitations to weigh before investing:
+- **Bulk-data only.** ~6–18× on sequential/random data reads and enables `mmap` (0 → fast) **when the
+  working set fits the window**; if data exceeds the window, reclaim thrashes and it *regresses*.
+- **No metadata help.** DAX accelerates data bytes of open files, not `LOOKUP`/`GETATTR`/`OPEN`
+  round-trips — so it does nothing for the metadata-bound pain of dev-tree shares (`git status`,
+  builds, `ls -R`). Profile the real workload first; if the bottleneck is FUSE round-trips, DAX is
+  the wrong lever.
+- **Cost is in the backend, not HDV.** Our directory backend (`lxutil::LxVolume`) has no
+  `setup_mapping` — only OpenVMM's `SectionFs` does. Real-file DAX needs net-new work: file→NT-section
+  conversion, window sizing/reclaim, Windows writeback/coherence. Guest must mount `-o dax` (long
+  experimental in Linux). Per-file DAX exists to skip the window for files <32 KB where it's a net loss.
+- Cheap de-risking step: a `SectionFs` round-trip spike (which *does* implement `setup_mapping`) proves
+  the HDV path end-to-end with zero backend work, before committing to the directory-backend changes.
 
-- [x] **Logging / diagnostics via `tracing` + `hvfs_set_logger` wired.** Internal diagnostics
-  are structured `tracing` events (the `virtio-hdv` transport firehose under `VIRTIO_HDV_TRACE`,
-  the aperture-cache stats under `VIRTIO_HDV_APERTURE_STATS`, and the ABI lifecycle/error events).
-  `hvfs_set_logger` (previously a no-op stub) now installs a best-effort process-global subscriber
-  that fans both our events *and* the reused OpenVMM crates' events out to the caller's C callback
-  (syslog-level mapped) and, when a dev env var is set, to stderr — routing decided once, emitters
-  destination-agnostic (the OpenVMM convention; see `CLAUDE.md` "Logging & diagnostics"). Proven by
-  the offline delivery unit test (`set_logger_delivers_events_and_none_is_safe`) and verified live:
-  `attach_abi` with `VIRTIO_HDV_TRACE=1` routes the data-path firehose through `tracing` to stderr.
-  Refs: `crates/hyperv_virtiofs/src/logging.rs`, `crates/virtio-hdv/src/{mem.rs,ratelimit.rs}`.
-
-- [x] **Guest memory: the "aperture-coherence" flakiness was a `max_address` ceiling bug (fixed).**
-  The long-blamed `file_selftest` flakiness ("aperture snapshot staleness on sustained I/O") was a
-  misdiagnosis. Byte-level instrumentation traced it to a FUSE `-EIO` (guest: `ls: Invalid argument`)
-  from a descriptor buffer at GPA ≈4.04 GiB rejected **before** the aperture path ran. Root cause:
-  Hyper-V remaps RAM above the 4 GiB MMIO hole, but `max_address` was set to the flat RAM size, so
-  high-RAM DMA buffers exceeded the ceiling and `guestmem` rejected them. Fixed by deriving
-  `max_address = 4 GiB + ram_size` (`crates/virtio-hdv/src/mem.rs::ram_size_to_max_gpa`).
-  `file_selftest` now passes reliably incl. 64 MiB transfers (~99.9 % aperture-cache hit rate, zero
-  failures). RE of both `vmdevicehost.dll` and `wsldevicehost.dll` confirmed there is **no closed
-  coherence-notification protocol** to mirror — `HdvGuestMemoryEvictionWorker` is quota management;
-  an aperture is a direct `VidMapMemoryBlockPageRangeEx` of *backed* pages and is coherent. `RearmNet`
-  (5 ms MSI re-arm) + boot-retry remain as belt-and-suspenders for a rarer boot-stall/EVENT_IDX
-  window (removal is a measured follow-up, not blind). Full writeup: [`testing.md`](testing.md),
-  [`hdv-aperture-internals.md`](hdv-aperture-internals.md).
-
-- [x] **GUID assignment is settled (not caller-tunable, by design).** The device **instance** id is
-  caller-supplied over the C ABI (`hvfs_add_share`'s `instance_id`); the device **class** id is the
-  platform-mandated `VIRTIO_FS_DEVICE_CLASS_ID` (a *custom* class is refused for a 2nd virtio-fs
-  device — proven in the hotplug spike, `ERROR_HV_INVALID_PARAMETER`); the device-**host** id is a
-  per-process constant (`HVFS_DEVICE_HOST_ID`) and needs no caller override under Model A (separate
-  processes, below). So the earlier "caller-supplied class/host GUIDs" idea is retired — only the
-  instance id varies, which is exactly what lets N shares coexist on one host.
-
-- [x] **Concurrency / deployment model: one device host per process (Model A).** The DLL
-  registers a device host in the calling process; the supported deployment runs each VM's
-  device host in its own process (as WSL runs one `wsldevicehost` surrogate per device).
-  Driving *multiple* device hosts in *one* process is **out of scope** — the in-process
-  proxy path races in the closed platform (`from_proxy` → `E_ACCESSDENIED 0x80070005`, plus
-  an unverified teardown/IPC/aperture surface) on a configuration WSL never ships, so we
-  don't claim it. Proven by `hcs-testvm/tests/concurrent_processes.rs` (two hosts, two
-  processes, concurrent); rationale in [`share-abi.md`](share-abi.md#deployment-model--one-device-host-per-process-model-a).
-  This retires the earlier "caller-supplied host GUID for in-process coexistence" idea —
-  separate processes need no such thing.
-
-- [x] **Reuse OpenVMM `virtio` + `virtiofs`** — wired as pinned git deps and compiling on
-  Windows (the whole tree: `mesh`, `chipset_device`, `pci_core`, `lx`/`lxutil` FUSE backend).
-  The foundational feasibility question is answered.
-- [x] **HDV FFI + RAII** — real `vmdevicehost.dll` bindings (`HdvInitializeDeviceHost`,
-  `HdvCreateDeviceInstance`, guest-memory apertures, doorbells, the proxy ABI) and safe
-  wrappers.
-- [x] **HDV attach handshake** *(the linchpin)* — the `ExternalRestricted` FlexibleIov proxy
-  path works in-process: `HdvInitializeDeviceHostForProxy` →
-  `IVmDeviceHostSupport::RegisterDeviceHost` → `HdvProxyDeviceHost`, then the guest enumerates
-  the device over VMBus VPCI ([`hdv-proxy-abi.md`](hdv-proxy-abi.md)).
-- [x] **virtio-pci-over-HDV transport** — an *adapter*, not a rewrite: implements
-  `hdv::pci::PciOps` over OpenVMM's public `VirtioPciDevice`, backing its seams with HDV —
-  `GuestMemory` ← apertures (`HdvCreateGuestMemoryAperture`), `PciInterruptModel::Msix` ←
-  `HdvDeliverGuestInterrupt`, PCI config + BAR MMIO ← HDV's device-vtable callbacks (routed
-  `(bar, offset)` → `find_bar` via internal BAR bases, since the VMBus VID owns guest-facing
-  BAR placement). Drives the reused `VirtioFsDevice`; the guest mounts and does file I/O.
-  (`shmem_size = 0` → no DAX BAR yet.)
-- [x] **Wire the C ABI (host/share, v2)** — the cdylib opens the compute system
-  (`HcsOpenComputeSystem`), proxy-registers one HDV device host (`hvfs_host_open`), and
-  **hot-adds a virtio-fs device per share at runtime** (`hvfs_add_share` →
-  `HcsModifyComputeSystem` Add); a guest hot-mounts each share through the shipped ABI
-  (`hcs-testvm/tests/attach_abi.rs`). Multiple shares coexist on one VM via the well-known
-  virtio-fs class id + a caller-supplied unique instance id. Full design:
-  [`share-abi.md`](share-abi.md).
+- Refs: `shmem_size = 0` scope note (`crates/virtio-hdv/src/lib.rs`); OpenVMM `SectionFs`,
+  `MemoryMapper`/`MappedMemoryRegion`. Background:
+  [LWN virtiofs DAX](https://lwn.net/Articles/813807/),
+  [per-file DAX / window cost](https://lwn.net/Articles/870248/),
+  [Red Hat fio numbers](https://www.mail-archive.com/virtio-fs@redhat.com/msg02371.html),
+  [cloud-hypervisor #5591](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/5591).

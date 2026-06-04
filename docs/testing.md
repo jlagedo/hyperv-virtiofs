@@ -161,6 +161,13 @@ tunable from the guest cmdline (`atelier.bigmb`/`perfmb`/`manyn`) without a rebu
   well-known class id is required. Passes today. Run with
   `cargo test -p hcs-testvm --test diag_cold_multidevice -- --ignored --nocapture`.
 
+- **`perf_baseline`** *(performance)* — boots the same ABI path 3× and measures the data path
+  (sequential write/read at 1M+4k, cache-cold reads, random 4k, metadata ops/s), writing
+  `target/perf-baseline/baseline.{md,json}`. Uses a repacked initramfs (`run_perfbench` in the
+  guest init, gated on `atelier.perfbench`). Run it via the orchestrator:
+  `.\test\run-perf-baseline.ps1` (add `-ApertureStats` for host cache stats). The captured
+  reference numbers and analysis live in [`perf-baseline.md`](perf-baseline.md).
+
 ### Capturing diagnostics
 
 All runtime diagnostics are structured `tracing` events (see `CLAUDE.md`, "Logging &
