@@ -188,6 +188,9 @@ fn perf_baseline_over_virtiofs() {
     let meta = env_u32("HVFS_PB_META", 1000);
     let rand = env_u32("HVFS_PB_RAND", 300);
     let jobs = env_u32("HVFS_PB_JOBS", 8).max(1);
+    // Guest vCPUs (default: the rig's 2). The parallel phases run J guest jobs;
+    // sweeping this tells guest-CPU-bound apart from host-path-bound.
+    let cpus = env_u32("HVFS_PB_CPUS", 0);
     let repeats = env_u32("HVFS_PB_REPEATS", 3).max(1);
     let attempts = env_u32("HVFS_PB_ATTEMPTS", 4).max(1);
 
@@ -209,7 +212,9 @@ fn perf_baseline_over_virtiofs() {
         let mut got = None;
         for attempt in 1..=attempts {
             eprintln!("--- run {run} attempt {attempt}/{attempts} ---");
-            if let Some(samples) = try_perfbench(&kernel, &initrd, &ws, seqmb, meta, rand, jobs) {
+            if let Some(samples) =
+                try_perfbench(&kernel, &initrd, &ws, seqmb, meta, rand, jobs, cpus)
+            {
                 got = Some(samples);
                 break;
             }
@@ -304,6 +309,10 @@ fn perf_baseline_over_virtiofs() {
 
 /// One full boot+benchmark cycle. Returns parsed samples on success, `None` if the
 /// boot stalled or the benchmark didn't finish (caller retries).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat bench params, one call site"
+)]
 fn try_perfbench(
     kernel: &str,
     initrd: &str,
@@ -312,8 +321,12 @@ fn try_perfbench(
     meta: u32,
     rand: u32,
     jobs: u32,
+    cpus: u32,
 ) -> Option<Vec<Sample>> {
     let mut cfg = RockyConfig::new(kernel, initrd);
+    if cpus > 0 {
+        cfg.processor_count = cpus;
+    }
     cfg.kernel_cmdline = format!(
         "console=ttyS0 atelier.hptags={TAG} atelier.perfbench=1 \
          atelier.pb_seqmb={seqmb} atelier.pb_meta={meta} atelier.pb_rand={rand} \

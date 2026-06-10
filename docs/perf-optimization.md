@@ -28,13 +28,45 @@ using it.
 |---|---|---|---|
 | **F** ✅ | Sharded aperture cache + `Arc<Aperture>` values (copy runs lock-free) | `mem.rs` | done |
 | **A′** ✅ | Aperture hit-path: `RwLock` + atomic recency + gated stats + fast hasher | `mem.rs` | done — baseline 3/3 clean, no regression |
-| **A** | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete | new modules in `virtio-hdv` | needs A′ |
-| **R** | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | alongside A |
+| **A** ✅ | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete, + adaptive inline at QD 1 | `offload.rs`, `pool.rs`, `payload.rs` | done — e2e 8/8 green; +47–103% at depth, QD-1 parity ([results](#measured-outcome-2026-06-10)) |
+| **R** ✅ | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | done — rode with A |
 | **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision |
 | **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | guest kernel ≥ 6.10 |
 | ~~C~~ | ~~async lxutil~~ | — | dropped — A makes it moot |
 
-Order: **A′ ✅ → A (+R) → measure → decide E/D → maybe B.**
+Order: **A′ ✅ → A (+R) ✅ → measured ✅ → decide E/D → maybe B / profile the residual serial cost.**
+
+## Measured outcome (2026-06-10)
+
+A landed gated behind `VIRTIO_HDV_WORKERS` (unset/`0` = upstream serial device). Full e2e
+ladder 8/8 green at `workers=8`. The headline matrix (medians of 3, `jobs=8`; serial-device
+vs offload, 2 vs 8 guest vCPUs — `HVFS_PB_CPUS`):
+
+| ops/s | serial 2cpu | serial 8cpu | offload 2cpu | offload 8cpu | offload vs serial @8cpu |
+|---|---:|---:|---:|---:|---:|
+| par_create | 2976 | 2949 | 4901 | 5988 | **+103%** |
+| par_stat | 8695 | 8928 | 9708 | 13157 | **+47%** |
+| par_read | 5000 | 5000 | 5555 | 7352 | **+47%** |
+
+What the campaign established:
+
+1. **QD 1 cannot show A — by protocol.** FUSE is synchronous per op, so every
+   single-threaded guest workload has exactly one request outstanding; the original bench
+   was QD-1 in *all* phases. The first A/B measured the pool's thread-hop as a ~10%
+   *regression* on 4k/metadata. Fixed by **adaptive inline** in the dispatcher (a lone
+   request on an idle queue runs inline, upstream-style; pool engages at batch > 1 or
+   work in flight) — QD-1 phases now at exact serial parity.
+2. **The serial device is device-bound; the offload device scales.** Serial is flat from
+   2 → 8 vCPUs (the worker is the ceiling); offload gains +22–36% more from 8 vCPUs.
+   New `PB_PAR_*` bench phases (8 parallel guest jobs, **shell builtins only** — a fork
+   per op measures guest process spawn, not host concurrency: host FUSE RTT is ~115 µs,
+   a guest fork ~1.5 ms) are what exposed this.
+3. **The residual ceiling is the still-serial per-op path**, not FUSE dispatch: the one
+   dispatcher task does pop + complete + one `HdvDeliverGuestInterrupt` per completion,
+   and every request crosses the aperture fallback several times (descriptor read,
+   payload read, reply write, used-ring write). Next levers, in rough order of expected
+   value: profile that per-op host path; batch/coalesce completions (one MSI per drain,
+   not per op); **B** (multiqueue = more dispatchers); **E/D** remain policy-gated.
 
 ---
 
@@ -262,9 +294,14 @@ revisit only if A leaves a parallelism ceiling.
 .\test\run-e2e.ps1 -Test file_selftest           # correctness gate for A's worker
 ```
 
-F already landed with no baseline regression (expected — the request path was still
-single-threaded; F's win is unlocked by A). A′ should likewise be no-regression. A is where the
-4k / metadata / random numbers move.
+A/B the offload device with `VIRTIO_HDV_WORKERS` (unset = serial, `8` = pool) and sweep
+guest parallelism with `HVFS_PB_JOBS` / vCPUs with `HVFS_PB_CPUS`. Only the `par_*` rows
+can move under A — the serial rows are QD-1 by protocol and gate *parity*, not gains
+(see [Measured outcome](#measured-outcome-2026-06-10)).
+
+F and A′ landed with no baseline regression (expected — the request path was still
+single-threaded; their win is unlocked by A). A landed at +47–103% on the parallel
+phases with serial parity everywhere else.
 
 ## Source map
 

@@ -22,9 +22,20 @@ The benchmark separates the two axes that decide where optimisation pays off (se
 | Sequential read, warm (1M) | `PB_SEQREAD_WARM` | guest page cache (bounds what the device path costs) | — |
 | Random 4k read, cache-cold | `PB_RANDREAD` | aperture-cache reuse/eviction worst case | aperture cache |
 | Metadata create / stat / readdir / delete | `PB_META_*` | FUSE round-trip latency (what DAX does **not** help) | request queue |
+| Parallel create / stat / open+read, J jobs | `PB_PAR_*` | host request **concurrency** (strategy A) | request dispatch |
 
 Block-size pairs (1M vs 4k) expose per-request overhead; the cold/warm read gap bounds the
 device-path cost; the metadata phases isolate FUSE round-trip cost from data throughput.
+
+The serial phases are **queue-depth-1 by protocol** (FUSE is synchronous per op from one
+thread), so they can never show request-level parallelism — that's what the `PB_PAR_*`
+phases exist for. Their per-op work is strictly shell **builtins** (`echo >`, `[ -s ]`,
+`read -r <`): a fork+exec per op on the small guest measures process spawn (~1.5 ms), not
+the host path (~115 µs FUSE RTT). Knobs: `HVFS_PB_JOBS` (default 8), `HVFS_PB_CPUS`
+(guest vCPUs), `VIRTIO_HDV_WORKERS` (host dispatch: unset = serial, N = offload pool).
+Reference (serial device, 2 vCPU, jobs=8): `par_create 2976` · `par_stat 8695` ·
+`par_read 5000` ops/s — see `perf-optimization.md` → *Measured outcome* for the offload
+matrix (+47–103% at 8 vCPUs).
 
 ## How to run
 
