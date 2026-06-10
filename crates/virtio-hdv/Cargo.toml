@@ -31,6 +31,11 @@ inspect.workspace = true
 # HDV callback thread (the device task completes them from the pool thread).
 futures = "0.3"
 
+# Required by the reused `virtio::VirtioDevice` trait signature (start_queue
+# returns anyhow::Result) — not used for our own error modeling (CLAUDE.md:
+# typed errors, hand-rolled). Already in the tree via the OpenVMM pins.
+anyhow = "1.0"
+
 # Structured diagnostics. We emit `tracing` events (the transport firehose + the
 # aperture-cache stats); the hyperv_virtiofs cdylib installs the subscriber that
 # routes them. See CLAUDE.md "Logging & diagnostics".

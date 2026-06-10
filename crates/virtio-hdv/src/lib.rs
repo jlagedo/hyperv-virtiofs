@@ -26,11 +26,8 @@
 mod handle;
 mod interrupt;
 mod mem;
-// Strategy A building blocks (docs/perf-optimization.md); consumed by the
-// offload device in A2 — the dead_code allows go away with it.
-#[allow(dead_code)]
+mod offload;
 mod payload;
-#[allow(dead_code)]
 mod pool;
 mod ratelimit;
 
@@ -213,10 +210,27 @@ impl VirtioHdvDevice {
 
         let fs = VirtioFs::new(workspace, None).map_err(|e| AttachError::Fs(e.to_string()))?;
         // shmem_size = 0: no DAX window, hence no BAR4 / shared_mem_mapper.
-        let fs_device = VirtioFsDevice::new(&driver_source, tag, fs, 0, None);
+        //
+        // VIRTIO_HDV_WORKERS gates request-level parallelism (strategy A,
+        // docs/perf-optimization.md): unset/0 keeps OpenVMM's serial device,
+        // N > 0 swaps in our offload device dispatching on an N-thread pool.
+        // Guest-visible behaviour (traits, config space) is identical.
+        let workers = pool::configured_workers();
+        let fs_device: Box<dyn virtio::DynVirtioDevice> = if workers > 0 {
+            tracing::info!(workers, "virtio-fs offload device (VIRTIO_HDV_WORKERS)");
+            Box::new(offload::OffloadVirtioFsDevice::new(
+                &driver_source,
+                tag,
+                fs,
+                workers,
+                None,
+            ))
+        } else {
+            Box::new(VirtioFsDevice::new(&driver_source, tag, fs, 0, None))
+        };
 
         let mut pci_dev = VirtioPciDevice::new(
-            Box::new(fs_device),
+            fs_device,
             &driver,
             guest_memory,
             PciInterruptModel::Msix(msi_conn.target()),

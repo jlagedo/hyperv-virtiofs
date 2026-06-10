@@ -1688,6 +1688,7 @@ dependencies = [
 name = "virtio-hdv"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chipset_device",
  "fuse",
  "futures",
