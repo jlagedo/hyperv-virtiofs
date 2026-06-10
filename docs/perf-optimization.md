@@ -1,157 +1,249 @@
-# virtio-fs data-path optimization
+# virtio-fs performance roadmap
 
-Where the per-request/metadata latency actually goes, and the ranked menu of fixes. Companion
-to [`perf-baseline.md`](perf-baseline.md) (the numbers this is measured against) and the DAX
-note in [`roadmap.md`](roadmap.md). All findings are traced to source, not inferred.
+**Implementation guide** for the data-path optimisation work. Each open item below is specced to
+the point of "open the file and write it": the types to add, the API to reuse, the lock/borrow
+discipline, and how to validate. Yardstick is [`perf-baseline.md`](perf-baseline.md) — re-run it
+after each step and compare *ratios/deltas*, not absolute MB/s.
 
-> Status: **analysis** — strategy **F is implemented and validated** (see
-> [F: implemented](#f-implemented--validated)); the rest is analysis. Re-run the baseline after
-> any change and compare ratios/deltas, not absolute MB/s.
+Source we link is pinned at rev `3d1207b`; a read-only worktree of it lives at `E:\dev\openvmm-pin`
+(see [Source map](#source-map)).
 
-## The hotpath
+## The bottleneck
 
-A single FUSE request (e.g. one `stat`) is serial at every stage:
+One request worker per device, draining one queue with a **serial** loop that runs the blocking
+FUSE/host-FS call inline before popping the next descriptor. That's `virtiofsd --thread-pool-size=1`;
+the cure is request-level parallelism on a single queue (target ~5–8× on 4k / metadata / random).
+The aperture copy and host NVMe are the real floor below that.
 
-```
-guest kick (MSI-X doorbell → BAR0 MMIO write)
-  └─ virtio-hdv/src/lib.rs  write_bar()                         [LOCK #1: Arc<Mutex<VirtioPciDevice>>]
-       └─ poll task on DefaultPool::spawn_on_thread("virtio-hdv")   ← ONE OS thread (lib.rs:195)
-            └─ VirtioFsWorker::run()   (openvmm virtiofs/src/virtio.rs:230)
-                 loop {
-                   let work = queue.next().await;                ← pop ONE descriptor
-                   let bytes = process_virtiofs_request(work);   ← SYNCHRONOUS, blocks
-                   queue.complete(work, bytes);                  ← only then, next iteration
-                 }
-                    └─ fuse Session::dispatch()  (sync match, session.rs:72)
-                         └─ VirtioFs::get_attr → inode.lstat()
-                              └─ lxutil NtReadFile / NtWriteFile / lstat   ← BLOCKING syscall
-                                 // openvmm lxutil/windows/mod.rs:1164  "// TODO: Async I/O"
-                 (every guest-memory touch inside the request:)
-                    └─ HdvApertureMem::read/write_fallback → with_mapping()
-                         [LOCK #3: Mutex<Cache>] held across the memcpy   (virtio-hdv/src/mem.rs:352)
-```
+Everything here is **in-repo, no OpenVMM patch**: we replace the device we hand the transport and
+finish our own aperture cache. The serial loop lives *inside* OpenVMM's `VirtioFsDevice`; we stop
+using it.
 
-### Three nested serializations (all confirmed in source)
+## Plan at a glance
 
-| Layer | Where | Evidence |
-|---|---|---|
-| (a) one OS thread per device | `virtio-hdv/src/lib.rs:195` `DefaultPool::spawn_on_thread` | single-threaded `pal_async` pool drives poll + the queue worker |
-| (b) one request queue, serial loop | openvmm `virtiofs/src/virtio.rs:73` `num_request_queues: 1`; worker loop has **no** `spawn` / `FuturesUnordered` / `select!` | pops one descriptor, awaits the handler to completion, then pops the next |
-| (c) blocking syscalls, no offload | openvmm `lxutil/windows/mod.rs:1164,1212` literally `// TODO: Async I/O`; `NtReadFile`/`NtWriteFile`/`lstat` run inline | the single thread parks on the host filesystem |
+| # | Item | Where | Gate |
+|---|---|---|---|
+| **F** ✅ | Sharded aperture cache + `Arc<Aperture>` values (copy runs lock-free) | `mem.rs` | done |
+| **A′** | Aperture hit-path: `RwLock` + atomic recency + per-shard stats + fast hasher | `mem.rs` | none — do first |
+| **A** | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete | new modules in `virtio-hdv` | needs A′ |
+| **R** | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | alongside A |
+| **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision |
+| **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | guest kernel ≥ 6.10 |
+| ~~C~~ | ~~async lxutil~~ | — | dropped — A makes it moot |
 
-This is structurally **identical to `virtiofsd --thread-pool-size=1`**, which the upstream
-literature measures at **~7,995 IOPS random-4k-read vs ~65,200 at `--thread-pool-size=64`
-(~8×)** — almost exactly our 4k/metadata gap. The baseline's "finding #1" is now mechanically
-explained: we *are* the pool-size-1 case.
+Order: **A′ → A (+R) → measure → decide E/D → maybe B.**
 
-## Two findings the source dig added
+---
 
-1. **Metadata is throttled by cache *policy*, not only by concurrency.** OpenVMM hardcodes
-   `attr_timeout = 1ms` and `entry_timeout = 0` (`virtiofs/src/lib.rs:38-43`), deliberately, for
-   rename correctness. virtiofsd's default is **5 s** (cache=auto = 1 s). With near-zero
-   timeouts the guest VFS re-issues `lookup`/`getattr` for almost every path access — exactly
-   what dominates `git status` / build-tree / `node_modules` walks. The **cold** baseline can't
-   see this (distinct files, nothing to cache), so the real-workload metadata cost is *larger*
-   than the baseline shows **and is separable from concurrency**.
+## A′ — aperture hit-path (`crates/virtio-hdv/src/mem.rs`)
 
-2. **The aperture lock is a latent, not current, bottleneck.** `Mutex<Cache>` (`mem.rs:352`) is
-   held across each memcpy. Today it is uncontended (one thread) — which is *why* baseline
-   finding #3 said the cache is not the bottleneck. The instant concurrency is added, N workers
-   serialize on this one mutex. It is an **enabler dependency**, not a standalone win.
-   `HdvApertureMem` is already `Send + Sync` (all `&self`), so the host-memory path is otherwise
-   concurrency-ready.
+F moved the memcpy out of the lock, but a cache **hit** (99.92% of accesses) still takes the shard
+`Mutex` *exclusively* to bump LRU recency, and bumps a shared `Stats` atomic. Under A, N workers
+re-serialise on the few shards that own the hot ring/descriptor pages. Make hits a shared read.
 
-## What we own vs. what is pinned upstream
+Changes:
 
-| Knob | Location | Ours? |
-|---|---|---|
-| executor (thread count) | `virtio-hdv/src/lib.rs:195` | **ours** |
-| aperture cache + its lock | `virtio-hdv/src/mem.rs` | **ours** |
-| host path / fs backend | `virtio-hdv/src/lib.rs` (`VirtioFs::new`) | **ours** |
-| serial worker loop | openvmm `virtiofs/src/virtio.rs:230` | pinned dep |
-| `num_request_queues: 1` | openvmm `virtiofs/src/virtio.rs:73` | pinned dep |
-| FUSE init flags, `max_write` (1 MiB) | openvmm `fuse/src/session.rs:19-34,495` | pinned dep |
-| `attr_timeout` / `entry_timeout` | openvmm `virtiofs/src/lib.rs:38-43` | pinned dep |
-| blocking → async syscalls | openvmm `lxutil/windows/mod.rs` | pinned dep |
+1. **Shard = `RwLock<Cache>` + per-shard `AtomicU64` clock.** Recency only needs to be comparable
+   *within* a shard (eviction is per-shard), so a per-shard clock avoids any global atomic.
+2. **`CachedAperture { ap: Arc<Aperture>, last_used: AtomicU64 }`.** Hit path: take the **read**
+   lock, `clock.fetch_add(1, Relaxed)`, `entry.last_used.store(n, Relaxed)`, clone the `Arc`,
+   release. Miss / insert / evict: take the **write** lock (the 0.08% path).
+3. **Gate stats off the hot path.** Read `VIRTIO_HDV_APERTURE_STATS` once into a `bool`; skip all
+   counter `fetch_add`s when off (today `stats.hits` increments unconditionally — a contended
+   cache line under A). Or make counters per-shard and sum on emit.
+4. **Hand-rolled page hasher.** Replace the `HashMap`'s SipHash with a ~15-line multiply-hasher
+   `BuildHasher` keyed on the page number. Safe: the map is ≤64 entries/shard, not
+   security-sensitive. (No new crate — CLAUDE.md.)
 
-The two highest-leverage levers live in the pinned OpenVMM crates. "Reuse, don't reimplement"
-(CLAUDE.md) still holds — these are small **carried patches on a fork-pin**, or upstream
-contributions, not reimplementations — but adopting them is a genuine decision.
+Leave `evict_one`'s O(n) scan as-is (n ≤ 64). `HdvApertureMem` stays `Send + Sync` (all `&self`).
 
-## Strategy menu (leverage ÷ effort)
+**Validate:** baseline shows **no regression** (the win only appears under A); aperture stats stay
+clean (`live/peak` unchanged, `fails/bad/notbound = 0`); a unit test that fills a shard past
+`PER_SHARD_MAX` still evicts LRU.
 
-| # | Strategy | Moves | Effort | Fork? |
-|---|---|---|---|---|
-| **A** | **Thread-pool offload in the worker.** Pop descriptor → hand `Work` to a host worker pool → run the blocking syscall in parallel → return result over a channel → complete on the worker task. The virtiofsd model. | 4k / metadata / random (~5–8× ceiling) | Med | openvmm `virtio.rs` + **our** `mem.rs` lock |
-| **F** ✅ | **Shard the aperture cache + `Arc<Aperture>` values** (99.92% hits = reads). *Prerequisite for A/B* — otherwise LOCK #3 re-serializes the parallel workers. **Done** — see [below](#f-implemented--validated). | enables A/B | Low–Med | ours only |
-| **E** | **Raise `attr`/`entry` timeouts** (e.g. 1 s; `FUSE_AUTO_INVAL_DATA` is already negotiated; handle the rename case with explicit invalidation). | real-workload metadata (large; benchmark-invisible) | Low (2 constants + caveat) | openvmm, tiny |
-| **D** | **`FUSE_WRITEBACK_CACHE`** in the init flags — coalesces small writes guest-side. | `seqwrite_4k` | Low | openvmm `session.rs` |
-| **B** | **Multiqueue + multithreaded executor.** `num_request_queues > 1` + replace `spawn_on_thread` with a multi-thread pool. | bulk + parallel (Linux 6.10: ~5×) | High | openvmm + our executor; **needs guest kernel ≥ 6.10** |
-| **C** | **Async / overlapped syscalls in lxutil** (the `// TODO: Async I/O`) — drive `NtReadFile` completions on the existing IOCP pool; concurrency with no extra threads. | everything, cleanly | High (deep lxutil surgery) | openvmm, large |
+---
 
-**Relationships:**
+## A — `OffloadVirtioFsDevice` (the ~8×)
 
-- **A is the headline** — the proven ~8× lever, works on a *single queue with no guest changes*.
-  Gated on **F** (else the cache mutex caps it). Complicated by `queue.next(&mut self)` /
-  `queue.complete(&mut self)` both borrowing the same `VirtioQueue`: completion must return to
-  the worker task (pop → dispatch-to-pool → channel-back → complete), keeping queue access
-  single-threaded while parallelizing the *work*.
-- **E + D are the cheapest real-world wins** and orthogonal to concurrency — tiny patches that
-  move metadata and 4k-writes for *actual* workloads before the executor is touched. **E likely
-  beats A for `git`/build trees**, which re-stat the same inodes.
-- **B (multiqueue)** is the weakest fit: needs guest ≥ 6.10, even virtiofsd upstream lacks the
-  device side, and each queue is still internally serial — so B only pays off *combined with* A
-  or C.
-- **C** is architecturally cleanest (no thread explosion; each pool thread is a real host worker)
-  but the largest change and upstream-only.
+Our own `virtio::VirtioDevice` that drains one request queue and runs the blocking
+`fuse::Session::dispatch` on a worker pool. **Reuses** the entire FUSE server + host-FS backend;
+we write only the queue/worker glue.
 
-## Recommended sequence
+### New files (`crates/virtio-hdv/src/`)
 
-1. **F** — shard the aperture cache. Ours, low-risk, unblocks everything; re-run the
-   baseline to confirm no regression. ✅ **Done** — see [below](#f-implemented--validated).
-2. **E + D** — timeouts + writeback flag. Tiny openvmm patches; measure metadata and
-   `seqwrite_4k`. Best $/line for real workloads.
-3. **A** — thread-pool offload. The structural ~8× for 4k / metadata / random, now safe because
-   F has landed.
-4. Defer **B / C** — bigger, guest-version- or upstream-gated; revisit only if A + F leave a
-   parallelism ceiling.
+| File | Contents |
+|---|---|
+| `payload.rs` | The two descriptor-chain adapters (`PayloadReader: io::Read + fuse::RequestReader`, `PayloadWriter: io::Write`) **copied ~verbatim** from OpenVMM `virtiofs/src/virtio_util.rs` (194 lines, public-API-only), plus a `PayloadReplySender: fuse::ReplySender` that writes IoSlices via `PayloadWriter` and records `bytes_written` (mirror of `VirtioReplySender` in `virtio.rs`). |
+| `pool.rs` | Hand-rolled blocking worker pool: N OS threads over `Arc<(Mutex<VecDeque<Job>>, Condvar)>` + shutdown flag. `submit(Job)`, `drain`, join on drop. Size from `VIRTIO_HDV_WORKERS` (default `clamp(cpus, 4..=16)`; `0` = inline, which can win at low queue depth). |
+| `offload.rs` | `OffloadVirtioFsDevice` + the per-queue dispatcher. |
 
-## F: implemented & validated
+### The worker model (no `Mutex<VirtioQueue>` — single-owner queue)
 
-Landed in `crates/virtio-hdv/src/mem.rs` (the recommended combo from the build-vs-buy review —
-hand-rolled, no new dependency):
+The queue's `try_next`/`complete`/`poll_kick` all take `&mut self`, so **the queue stays owned by
+its dispatcher task**; pool threads never touch it. Work flows out to the pool and results flow
+back over a channel; the dispatcher is the only place `complete` is called (out-of-order is fine —
+the used ring carries the descriptor index).
 
-- **`Arc<Aperture>` values (1a).** A lookup hands back a cheap `Arc` clone; the memcpy runs with
-  the lock released. A concurrent eviction drops only the cache's `Arc`, so the in-flight copy
-  keeps the mapping alive and the unmap defers to the last holder — no use-after-free, no lock
-  held across the copy.
-- **Sharded lock (2a).** One global `Mutex<Cache>` → `[Mutex<Cache>; 16]`, routed by guest page
-  number (`(base >> 12) & 15`). The `MAX_ENTRIES` cap is enforced per shard (`PER_SHARD_MAX = 64`)
-  so the global total is unchanged.
-- **Kept (3a + 4).** Simple per-shard LRU; the bounded `ERROR_NOT_ENOUGH_QUOTA` evict-and-retry
-  loop, now per shard. Plus a global live-count (`inc_live`/`dec_live`) since per-shard `len()` is
-  no longer the global count, and a poison-tolerant shard lock (the lock is taken on the un-guarded
-  OpenVMM worker thread).
+Per request queue, `start_queue` spawns one dispatcher task on our `VmTaskDriver`:
 
-**Validation** (live, E: NVMe, 3/3 clean, vs. the [baseline](perf-baseline.md)): every metric
-within the run-to-run band — **no regression**, exactly as expected since the OpenVMM worker is
-still single-threaded (F's win is gated on strategy A). Aperture stats confirm correctness:
+```text
+dispatcher (single async task, owns VirtioQueue):
+  loop {
+    // 1. drain everything currently available — no await, no borrow held across await
+    while let Some(work) = queue.try_next()? {
+        inflight.fetch_add(1);
+        pool.submit(Job { work, mem: mem.clone(), session: session.clone(), done: done_tx.clone() });
+    }
+    // 2. park until either a guest kick OR a completion, then loop
+    poll_fn(|cx| {
+        let mut progressed = false;
+        while let Poll::Ready(Some((work, bytes))) = done_rx.poll_next_unpin(cx) {
+            queue.complete(work, bytes);          // signals the MSI via the queue's notify
+            inflight.fetch_sub(1);
+            progressed = true;
+        }
+        match queue.poll_kick(cx) {               // re-arms the queue-event waker
+            Poll::Ready(()) => Poll::Ready(()),
+            Poll::Pending if progressed => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,       // both wakers (done_rx + kick) registered
+        }
+    }).await;
+  }
 
-```
-            ops        hit%     creates evicts quota_retries  fails/bad/notbound  live/peak  max_span
-baseline  1,122,304   99.92%      924    413      413              0/0/0           511/511     4096
-post-F    1,122,304   99.92%      868    357      357              0/0/0           511/511     4096
+pool worker (OS thread, blocking):
+  let reader = PayloadReader::new(&mem, &work);
+  match fuse::Request::new(reader) {
+    Ok(req) => {
+        let mut tx = PayloadReplySender::new(&mem, &work);
+        session.dispatch(req, &mut tx, None);     // mapper = None (shmem_size = 0, no DAX)
+        done.unbounded_send((work, tx.bytes_written));
+    }
+    Err(_) => { notify_corruption(); done.unbounded_send((work, 0)); }
+  }
 ```
 
-`live/peak = 511/511` matches the pre-sharding count **exactly** (proves the global counter is
-right); `fails/bad/notbound = 0` (per-shard quota handling added no new failure mode); hit rate
-identical. F is in place as the concurrency enabler; the measurable win arrives with **A**.
+- `done` channel: `futures::channel::mpsc::unbounded` (futures is already a dep). Sender is `Send`;
+  `VirtioQueueCallbackWork` is plain data (`Send`), so it crosses threads and back cleanly.
+- **Lock/borrow rule:** never hold a queue borrow across `.await`. The `poll_fn` closure borrows
+  `queue` only during each poll; `try_next` drains synchronously. This is the whole correctness
+  crux of A.
+- `mem: GuestMemory` and `session: Arc<fuse::Session>` are cheap to clone and `Sync`; pool threads
+  write replies straight into guest memory (→ our aperture cache).
 
-## References
+### `VirtioDevice` impl
 
-- virtiofsd thread-pool-size — <https://www.mail-archive.com/virtio-fs@redhat.com/msg03251.html>
-- `--thread-pool-size=0` (inline can win at low queue depth) — <https://listman.redhat.com/archives/virtio-fs/2020-November/msg00093.html>
-- Linux 6.10 virtio-fs multiqueue ~5× (device-side support required) — <https://www.phoronix.com/news/Linux-6.10-FUSE>
-- Proxmox cache-mode / thread A-B numbers — <https://forum.proxmox.com/threads/virtiofsd-in-pve-8-0-x.130531/>
-- weka thread/DAX planning (per-thread cost framing) — <https://github.com/weka/virtiofs-bench/blob/main/notes/threads_and_dax_planning.md>
-- FUSE writeback-cache semantics — <https://www.kernel.org/doc/Documentation/filesystems/fuse-io.txt>
+`OffloadVirtioFsDevice` must be `InspectMut + Send` (derive `InspectMut`, `#[inspect(skip)]` the
+internals). Mirror `VirtioFsDevice`:
+
+- `traits()`: `device_id = FS`, features `ring_event_idx | ring_indirect_desc | ring_packed`,
+  `max_queues = 2`, `device_register_length = size_of(config)`. Config space = `{ tag: [u8;36],
+  num_request_queues: u32 = 1 }` (keep single-queue; B raises this later).
+- `read_registers_u32` / `write_registers_u32`: serve the config bytes (copy `VirtioFsDevice`).
+- `start_queue(idx, resources, features, initial_state)`: build the queue exactly as
+  `VirtioFsDevice` does —
+  `VirtioQueue::new(*features, resources.params, resources.guest_memory.clone(), resources.notify,
+  PolledWait::new(&driver, resources.event)?, initial_state)` — then spawn the dispatcher above.
+  Handle queue 0 (hiprio) the same way (one pool serves all queues), as `VirtioFsDevice` does.
+- `stop_queue(idx)`: signal the dispatcher to stop accepting new work, **quiesce** (await
+  `inflight == 0` so in-flight replies complete), then return `queue.queue_state()`.
+- `reset`: drop all dispatchers, `session.destroy()`.
+
+### Build it from (reuse)
+
+- `fuse::Session::new(VirtioFs::new(workspace, opts))` — all FUSE ops + host I/O, unchanged.
+  `dispatch(&self)` is `Sync`; `VirtioFs`/`lxutil` are `Send + Sync` and safe under concurrent
+  calls (verified).
+- `virtio::{VirtioQueue, QueueResources, VirtioQueueCallbackWork, DeviceTraits}`.
+
+### Integration (`crates/virtio-hdv/src/lib.rs`)
+
+Replace the two lines that build the device:
+
+```rust
+// before:
+let fs_device = VirtioFsDevice::new(&driver_source, tag, fs, 0, None);
+let mut pci_dev = VirtioPciDevice::new(Box::new(fs_device), …)?;
+// after:
+let dev = OffloadVirtioFsDevice::new(&driver_source, tag, fs, /*shmem*/0);
+let mut pci_dev = VirtioPciDevice::new(Box::new(dev), …)?;
+```
+
+Everything else — `VirtioPciDevice`, the `PciOps`/HDV bridge, MSI, apertures, BAR routing — is
+untouched. Gate behind `VIRTIO_HDV_WORKERS` (set `0`/unset → current inline behaviour) so we A/B on
+the baseline.
+
+**Validate:** the e2e ladder (`file_selftest`, `PROOF_COMPLETE_PASS`) must stay green — it's the
+correctness gate for the new worker. Then the perf baseline should show 4k / metadata / random
+climb while 1M-block holds; aperture stats stay clean. Watch for: stuck `inflight` on stop,
+descriptors never completed (used-ring stall), reply-write past the writable payload.
+
+---
+
+## R — interrupt re-arm (`lib.rs` `RearmNet`, `interrupt.rs`)
+
+Completion volume rises sharply under A, so fix the re-arm net's waste:
+
+- **Drop the per-tick `Vec` allocation** (`lib.rs` re-arm loop currently `clone()`s `seen` every
+  5 ms): reuse one buffer — `local.clear(); local.extend_from_slice(&guard); drop(guard);` then
+  deliver.
+- **Activity-gated backoff:** `signal_msi` stamps an `AtomicU64 last_activity`. Tick tight (5 ms)
+  for a window after the last completion; back off (→ ~50–100 ms) when idle. Keeps the lost-MSI
+  safety net but stops machine-gunning an idle guest. The 5 ms tick is a latency-vs-CPU knob — keep
+  it tight *under load*, loose only when quiet.
+
+**Validate:** idle CPU drops; under load, no latency regression vs A-without-backoff.
+
+---
+
+## E / D — coherence knobs (POLICY — decide before coding)
+
+Both are reachable **without a patch** by wrapping the `Fuse` backend in our own type that
+delegates to `VirtioFs`:
+
+- **E** — rewrite `ENTRY_TIMEOUT` / `ATTRIBUTE_TIMEOUT` in the `fuse_entry_out` / `fuse_attr_out`
+  replies before returning them.
+- **D** — set `info.want |= FUSE_WRITEBACK_CACHE` in our wrapping `Fuse::init` (if the kernel is
+  capable).
+
+But each **spends a coherence guarantee OpenVMM kept on purpose** (`entry_timeout = 0` for
+rename/out-of-band-mutation correctness; writeback changes durability/mtime semantics). **Gate:
+who writes the share?** Guest-sole-writer → safe. Concurrent host writer → needs explicit
+invalidation (host `ReadDirectoryChangesW` watcher → FUSE `notify_inval_*`), which is real work.
+Do **not** implement until the consumer's ownership model is fixed. This is a product decision, not
+a tuning knob.
+
+---
+
+## B — multiqueue (guest-gated)
+
+Once A exists, multiqueue is just A per queue: bump `max_queues` and the `num_request_queues` our
+device reports, and run a dispatcher+pool per request queue. **Needs guest kernel ≥ 6.10** (older
+guests use one request queue regardless). Lowest priority — revisit only if A leaves a parallelism
+ceiling.
+
+---
+
+## Validation
+
+```pwsh
+.\test\run-perf-baseline.ps1 -ApertureStats      # ratios vs perf-baseline.md
+.\test\run-e2e.ps1 -Test file_selftest           # correctness gate for A's worker
+```
+
+F already landed with no baseline regression (expected — the request path was still
+single-threaded; F's win is unlocked by A). A′ should likewise be no-regression. A is where the
+4k / metadata / random numbers move.
+
+## Source map
+
+- **Pinned worktree:** `E:\dev\openvmm-pin` (rev `3d1207b`) — read the exact linked source here.
+- **Reuse (public API):**
+  `virtio::{VirtioDevice, VirtioPciDevice, VirtioQueue, QueueResources, VirtioQueueCallbackWork (`payload`, `read_at_offset`, `write_at_offset`), DeviceTraits}`;
+  `fuse::{Session, Fuse, Request, RequestReader, ReplySender, Mapper}`;
+  `virtiofs::VirtioFs`; `guestmem::GuestMemory`.
+  Queue API: `VirtioQueue::{try_next, poll_kick, complete, queue_state}` (`virtio/src/common.rs`).
+- **Copy (private module, public-API-only, 194 lines):** `virtiofs/src/virtio_util.rs` →
+  `crates/virtio-hdv/src/payload.rs`.
+- **Do *not* use:** the serial worker loop at `virtiofs/src/virtio.rs:236` — that's what A replaces.
+- **Hardcoded in upstream (E/D context):** `attr/entry` timeouts `virtiofs/src/lib.rs:38-43`;
+  FUSE flags / `max_write` `fuse/src/session.rs:19-39`.
