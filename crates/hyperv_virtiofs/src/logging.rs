@@ -121,19 +121,27 @@ impl<S: Subscriber> Layer<S> for CallbackLayer {
 
 /// Whether any developer diagnostic env var is set — gates the stderr layer.
 fn dev_env_set() -> bool {
-    ["VIRTIO_HDV_TRACE", "VIRTIO_HDV_APERTURE_STATS", "RUST_LOG"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some())
+    [
+        "VIRTIO_HDV_TRACE",
+        "VIRTIO_HDV_APERTURE_STATS",
+        "VIRTIO_HDV_REQ_STATS",
+        "RUST_LOG",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some())
 }
 
 /// Build the global level filter: `RUST_LOG` if set, else INFO. `VIRTIO_HDV_TRACE`
 /// raises our transport crates to TRACE (the per-access data-path firehose);
-/// `VIRTIO_HDV_APERTURE_STATS` alone raises `virtio_hdv` to DEBUG (the cache stats).
+/// `VIRTIO_HDV_APERTURE_STATS` or `VIRTIO_HDV_REQ_STATS` alone raises `virtio_hdv`
+/// to DEBUG (the aperture-cache / request-path stats events).
 fn build_filter() -> EnvFilter {
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let extra: &[&str] = if std::env::var_os("VIRTIO_HDV_TRACE").is_some() {
         &["virtio_hdv=trace", "hyperv_virtiofs=trace"]
-    } else if std::env::var_os("VIRTIO_HDV_APERTURE_STATS").is_some() {
+    } else if std::env::var_os("VIRTIO_HDV_APERTURE_STATS").is_some()
+        || std::env::var_os("VIRTIO_HDV_REQ_STATS").is_some()
+    {
         &["virtio_hdv=debug"]
     } else {
         &[]

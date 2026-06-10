@@ -220,6 +220,14 @@ impl VirtioDevice for OffloadVirtioFsDevice {
     }
 }
 
+impl Drop for OffloadVirtioFsDevice {
+    fn drop(&mut self) {
+        // Device teardown is the "run is over" signal for the request-path
+        // profile (cumulative counters; a no-op unless VIRTIO_HDV_REQ_STATS).
+        crate::reqstats::global().emit_final();
+    }
+}
+
 /// Per-queue dispatcher state; `run` consumes it and gives the queue back on
 /// stop.
 struct Dispatcher {
@@ -233,7 +241,12 @@ struct Dispatcher {
 impl Dispatcher {
     /// pop → pool → channel-back → complete, until stopped (then quiesce).
     async fn run(mut self, mut stop_rx: oneshot::Receiver<()>) -> VirtioQueue {
-        let (done_tx, mut done_rx) = mpsc::unbounded::<(VirtioQueueCallbackWork, u32)>();
+        // Request-path profiling (VIRTIO_HDV_REQ_STATS): every timer below is
+        // `None` when disabled, so the production path never reads the clock.
+        // The channel's third field is the job-end stamp for the done-hop stage.
+        let stats = crate::reqstats::global();
+        let (done_tx, mut done_rx) =
+            mpsc::unbounded::<(VirtioQueueCallbackWork, u32, Option<std::time::Instant>)>();
         let mut inflight: usize = 0;
         // Reused drain buffer: popping the batch before dispatching is what
         // lets us see its size (the adaptive-inline test below).
@@ -248,6 +261,7 @@ impl Dispatcher {
             // 1. Drain everything currently available — synchronous, no await,
             //    no queue borrow held across a suspension point.
             if !stopping && !failed {
+                let t_pop = stats.now();
                 loop {
                     match self.queue.try_next() {
                         Ok(Some(work)) => batch.push(work),
@@ -262,6 +276,9 @@ impl Dispatcher {
                         }
                     }
                 }
+                if !batch.is_empty() {
+                    stats.rec_pop(t_pop, batch.len());
+                }
             }
 
             // 2a. Adaptive inline: a lone request on an otherwise-idle queue
@@ -274,6 +291,7 @@ impl Dispatcher {
                 let work = batch.pop().expect("len == 1");
                 // Same panic containment as the pool path: complete with 0
                 // bytes rather than losing the descriptor.
+                let t_dispatch = stats.now();
                 let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     dispatch_one(&self.session, &self.mem, &work, &*self.notify_corruption)
                 }))
@@ -283,7 +301,10 @@ impl Dispatcher {
                     );
                     0
                 });
+                stats.rec_inline(t_dispatch);
+                let t_complete = stats.now();
                 self.queue.complete(work, bytes);
+                stats.rec_complete(t_complete);
                 // Anything that arrived while we were blocked is picked up by
                 // the next drain — and, being a batch > 1, goes to the pool.
                 continue;
@@ -296,10 +317,13 @@ impl Dispatcher {
                 let session = self.session.clone();
                 let notify = self.notify_corruption.clone();
                 let done = done_tx.clone();
+                let t_submit = stats.now();
                 self.pool.submit(Box::new(move || {
+                    stats.rec_pool_wait(t_submit);
                     // Contain panics *here* (not just in the pool) so `work`
                     // always flows back: a lost work item is a descriptor that
                     // never completes — a guest request that hangs forever.
+                    let t_dispatch = stats.now();
                     let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dispatch_one(&session, &mem, &work, &*notify)
                     }))
@@ -309,7 +333,8 @@ impl Dispatcher {
                         );
                         0
                     });
-                    let _ = done.unbounded_send((work, bytes));
+                    stats.rec_pool(t_dispatch);
+                    let _ = done.unbounded_send((work, bytes, stats.now()));
                 }));
             }
             if stopping && inflight == 0 {
@@ -320,9 +345,12 @@ impl Dispatcher {
             //    first. All wakers are registered in one poll pass.
             poll_fn(|cx| {
                 let mut progressed = false;
-                while let Poll::Ready(Some((work, bytes))) = done_rx.poll_next_unpin(cx) {
+                while let Poll::Ready(Some((work, bytes, t_done))) = done_rx.poll_next_unpin(cx) {
+                    stats.rec_done_hop(t_done);
                     // Signals the MSI via the queue's notify interrupt.
+                    let t_complete = stats.now();
                     self.queue.complete(work, bytes);
+                    stats.rec_complete(t_complete);
                     inflight -= 1;
                     progressed = true;
                 }

@@ -21,6 +21,8 @@
 .PARAMETER Jobs      Parallel guest jobs for the PB_PAR_* phases (atelier.pb_jobs). Default 8.
 .PARAMETER Repeats   Benchmark runs to median over (HVFS_PB_REPEATS). Default 3.
 .PARAMETER ApertureStats  Enable VIRTIO_HDV_APERTURE_STATS=1 (host aperture-cache stats).
+.PARAMETER ReqStats  Enable VIRTIO_HDV_REQ_STATS=1 (host request-path stage timings;
+                     only the offload device emits them, so pair with VIRTIO_HDV_WORKERS).
 .PARAMETER Rebuild   Force-rebuild the perfbench initramfs from test/guest/init.
 .PARAMETER Distro    WSL distro for the repack. Default: WSL default distro.
 .PARAMETER WorkspaceDir  Share backing dir (the disk under test). Default: repo-local
@@ -39,6 +41,7 @@ param(
   [int]$Jobs = 8,
   [int]$Repeats = 3,
   [switch]$ApertureStats,
+  [switch]$ReqStats,
   [switch]$Rebuild,
   [string]$Distro,
   [string]$WorkspaceDir
@@ -105,6 +108,7 @@ if ($WorkspaceDir) {
   Remove-Item Env:\HVFS_PB_WS -ErrorAction SilentlyContinue
 }
 if ($ApertureStats) { $env:VIRTIO_HDV_APERTURE_STATS = "1" } else { Remove-Item Env:\VIRTIO_HDV_APERTURE_STATS -ErrorAction SilentlyContinue }
+if ($ReqStats) { $env:VIRTIO_HDV_REQ_STATS = "1" } else { Remove-Item Env:\VIRTIO_HDV_REQ_STATS -ErrorAction SilentlyContinue }
 
 Write-Host "Running perf baseline (seqmb=$Seqmb meta=$Meta rand=$Rand jobs=$Jobs repeats=$Repeats apertureStats=$ApertureStats workers=$env:VIRTIO_HDV_WORKERS)" -ForegroundColor Cyan
 Write-Host "  log: $log"
@@ -118,6 +122,12 @@ if ($ApertureStats) {
   Write-Host "`n--- host aperture-cache stats (final per run) ---" -ForegroundColor Cyan
   Select-String -Path $log -Pattern "aperture stats|phase=final|hits=|creates=|evicts=|quota_retries=" |
     ForEach-Object { $_.Line.Trim() } | Select-Object -Last 20
+}
+
+if ($ReqStats) {
+  Write-Host "`n--- host request-path stats (last summaries) ---" -ForegroundColor Cyan
+  Select-String -Path $log -Pattern "request path stats" |
+    ForEach-Object { $_.Line.Trim() } | Select-Object -Last 12
 }
 
 $md = Join-Path $reportDir "baseline.md"

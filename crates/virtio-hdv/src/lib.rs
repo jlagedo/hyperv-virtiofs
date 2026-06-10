@@ -30,6 +30,7 @@ mod offload;
 mod payload;
 mod pool;
 mod ratelimit;
+mod reqstats;
 
 pub use handle::DeviceHandle;
 
