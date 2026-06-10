@@ -157,6 +157,9 @@ run_selftest() {
 #   PB_META_STAT   n=.. ops=..            stat   N small files (cold)
 #   PB_META_READDIR n=.. ms=..            list the directory
 #   PB_META_DELETE n=.. ops=..            unlink N small files
+#   PB_PAR_CREATE jobs=.. n=.. ops=..     create, J parallel jobs (host concurrency)
+#   PB_PAR_STAT   jobs=.. n=.. ops=..     stat (cold, builtin), J parallel jobs
+#   PB_PAR_READ   jobs=.. n=.. ops=..     small-file open+read (cold, builtin), J jobs
 #   PERFBENCH_DONE tag=<t>                benchmark finished (test waits on this)
 drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; }
 # MB/s (decimal) from a byte count and an elapsed-ms value; 0 if not measurable.
@@ -228,6 +231,52 @@ run_perfbench() {
   t0=$(date +%s%N); i=0; while [ "$i" -lt "$meta" ]; do rm -f "$md/f_$i"; i=$(( i + 1 )); done; sync; t1=$(date +%s%N)
   ms=$(( (t1 - t0) / 1000000 )); echo "PB_META_DELETE n=$meta ms=$ms ops=$(opss "$meta" "$ms")"
   rm -rf "$md"
+
+  # (6) CONCURRENT latency-bound ops — the same create / stat / random-4k storms, but
+  #     issued from $jobs parallel processes. The serial phases above are queue-depth-1
+  #     by construction (the FUSE protocol is synchronous per op: one round-trip
+  #     outstanding at a time), so they CANNOT show request-level parallelism on the
+  #     host; these phases are what strategy A moves. While one job blocks on its FUSE
+  #     reply the others issue theirs, so the device sees ~jobs outstanding requests
+  #     even on a single vCPU.
+  jobs=$(sed -n 's/.*atelier\.pb_jobs=\([0-9]*\).*/\1/p' /proc/cmdline); [ -n "$jobs" ] || jobs=8
+  per=$(( meta / jobs )); [ "$per" -gt 0 ] || per=1
+  n=$(( jobs * per ))
+  pd="$mp/pb_par"; rm -rf "$pd"
+  j=0; while [ "$j" -lt "$jobs" ]; do mkdir -p "$pd/d$j"; j=$(( j + 1 )); done
+  t0=$(date +%s%N)
+  j=0; while [ "$j" -lt "$jobs" ]; do
+    ( i=0; while [ "$i" -lt "$per" ]; do echo x > "$pd/d$j/f_$i"; i=$(( i + 1 )); done ) &
+    j=$(( j + 1 ))
+  done
+  wait; sync
+  t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+  echo "PB_PAR_CREATE jobs=$jobs n=$n ms=$ms ops=$(opss "$n" "$ms")"
+  # All per-op work in these jobs must be shell BUILTINS: a fork+exec per op
+  # (stat, dd, cat) on this 2-vCPU guest measures process spawn, not host FUSE
+  # concurrency. `[ -s f ]` is a builtin doing a stat syscall (lookup+getattr
+  # round-trips — entry_timeout=0 sends every lookup to the host).
+  drop_caches
+  t0=$(date +%s%N)
+  j=0; while [ "$j" -lt "$jobs" ]; do
+    ( i=0; while [ "$i" -lt "$per" ]; do [ -s "$pd/d$j/f_$i" ]; i=$(( i + 1 )); done ) &
+    j=$(( j + 1 ))
+  done
+  wait
+  t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+  echo "PB_PAR_STAT jobs=$jobs n=$n ms=$ms ops=$(opss "$n" "$ms")"
+  # Parallel cold small-file reads via the `read` builtin (redirection opens the
+  # file): OPEN + READ + RELEASE round-trips per file, no fork.
+  drop_caches
+  t0=$(date +%s%N)
+  j=0; while [ "$j" -lt "$jobs" ]; do
+    ( i=0; while [ "$i" -lt "$per" ]; do read -r _x < "$pd/d$j/f_$i"; i=$(( i + 1 )); done ) &
+    j=$(( j + 1 ))
+  done
+  wait
+  t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+  echo "PB_PAR_READ jobs=$jobs n=$n ms=$ms ops=$(opss "$n" "$ms")"
+  rm -rf "$pd"
 
   echo "================ PERFBENCH_DONE tag=$t ================"
 }

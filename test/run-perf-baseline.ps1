@@ -18,6 +18,7 @@
 .PARAMETER Seqmb     Sequential file size MiB (guest atelier.pb_seqmb). Default 64.
 .PARAMETER Meta      Metadata file count (guest atelier.pb_meta). Default 1000.
 .PARAMETER Rand      Random 4k read count (guest atelier.pb_rand). Default 300.
+.PARAMETER Jobs      Parallel guest jobs for the PB_PAR_* phases (atelier.pb_jobs). Default 8.
 .PARAMETER Repeats   Benchmark runs to median over (HVFS_PB_REPEATS). Default 3.
 .PARAMETER ApertureStats  Enable VIRTIO_HDV_APERTURE_STATS=1 (host aperture-cache stats).
 .PARAMETER Rebuild   Force-rebuild the perfbench initramfs from test/guest/init.
@@ -35,6 +36,7 @@ param(
   [int]$Seqmb = 64,
   [int]$Meta = 1000,
   [int]$Rand = 300,
+  [int]$Jobs = 8,
   [int]$Repeats = 3,
   [switch]$ApertureStats,
   [switch]$Rebuild,
@@ -93,6 +95,7 @@ $env:HVFS_INITRD = (Resolve-Path $perfInitrd).Path
 $env:HVFS_PB_SEQMB = "$Seqmb"
 $env:HVFS_PB_META = "$Meta"
 $env:HVFS_PB_RAND = "$Rand"
+$env:HVFS_PB_JOBS = "$Jobs"
 $env:HVFS_PB_REPEATS = "$Repeats"
 if ($WorkspaceDir) {
   New-Item -ItemType Directory -Force $WorkspaceDir | Out-Null
@@ -103,7 +106,7 @@ if ($WorkspaceDir) {
 }
 if ($ApertureStats) { $env:VIRTIO_HDV_APERTURE_STATS = "1" } else { Remove-Item Env:\VIRTIO_HDV_APERTURE_STATS -ErrorAction SilentlyContinue }
 
-Write-Host "Running perf baseline (seqmb=$Seqmb meta=$Meta rand=$Rand repeats=$Repeats apertureStats=$ApertureStats)" -ForegroundColor Cyan
+Write-Host "Running perf baseline (seqmb=$Seqmb meta=$Meta rand=$Rand jobs=$Jobs repeats=$Repeats apertureStats=$ApertureStats workers=$env:VIRTIO_HDV_WORKERS)" -ForegroundColor Cyan
 Write-Host "  log: $log"
 
 # --nocapture so guest console + (optional) aperture stats reach the log.
