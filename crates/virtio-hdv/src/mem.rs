@@ -30,13 +30,17 @@
 //! signal WSL's `HdvGuestMemoryEvictionWorker` services) we evict the
 //! least-recently-used entry and retry, synchronously.
 //!
-//! **Sharding for concurrency.** The cache is split into `SHARDS` independently-locked
-//! shards (routed by guest page number), and each cached entry is an `Arc<Aperture>`.
-//! A lookup holds a shard lock only long enough to clone the `Arc`; the copy runs with
+//! **Sharding for concurrency.** The cache is split into `SHARDS` independent shards
+//! (routed by guest page number), each an `RwLock` map of `Arc<Aperture>` values with
+//! a per-shard atomic recency clock. A **hit** — 99.9%+ of accesses — takes the shard
+//! lock *shared*, restamps recency through atomics, and clones the `Arc` out; only a
+//! miss (map + insert, with LRU evict) takes it exclusively. The copy then runs with
 //! no lock held, and a concurrent eviction merely drops the cache's `Arc` while the
-//! in-flight copy keeps the mapping alive (the unmap defers to the last holder). This
-//! removes the single global lock from the per-access path so parallel request
-//! handling isn't re-serialised here.
+//! in-flight copy keeps the mapping alive (the unmap defers to the last holder). So
+//! parallel request handling is never re-serialised here: not by the map lock, not by
+//! the recency bump, and not by the stats counters, which are skipped entirely unless
+//! `VIRTIO_HDV_APERTURE_STATS` is set. The map's hasher is a hand-rolled multiply-mix
+//! (the keys are page-aligned ranges; SipHash buys nothing here).
 //!
 //! **The "staleness" was mostly a ceiling bug.** The long-blamed `file_selftest`
 //! flakiness ("aperture snapshot staleness on sustained I/O") was traced to
@@ -67,7 +71,7 @@ use hdv::Aperture;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 const PAGE: u64 = 4096;
@@ -81,9 +85,10 @@ const ERROR_NOT_ENOUGH_QUOTA: u32 = 0x8007_0718;
 /// enforced **per shard** ([`PER_SHARD_MAX`]), so the global total stays
 /// ~`MAX_ENTRIES` (`SHARDS * PER_SHARD_MAX`).
 const MAX_ENTRIES: usize = 1024;
-/// Number of cache shards (power of two). Each shard is an independent
-/// `Mutex<Cache>`, so accesses to different shards never contend — the prerequisite
-/// for parallel request handling (the lock, not the copy, is the only serial point).
+/// Number of cache shards (power of two). Each shard is independently locked, so
+/// accesses to different shards never contend, and hits within a shard share its
+/// read lock — the prerequisite for parallel request handling (the lock, not the
+/// copy, is the only serial point).
 const SHARDS: usize = 16;
 /// Per-shard entry cap, so the global total stays bounded by [`MAX_ENTRIES`].
 const PER_SHARD_MAX: usize = MAX_ENTRIES / SHARDS;
@@ -107,6 +112,11 @@ fn stats_on() -> bool {
 /// inline) — rather than collapsing them all into one opaque error count.
 #[derive(Default)]
 struct Stats {
+    /// Whether counters are recorded at all (`VIRTIO_HDV_APERTURE_STATS`), captured
+    /// once at construction. When off, every counter below is skipped — under
+    /// parallel request handling even relaxed `fetch_add`s on shared counters are a
+    /// contended cache line on the hot path.
+    enabled: bool,
     ops: AtomicU64,
     hits: AtomicU64,
     creates: AtomicU64,
@@ -122,16 +132,36 @@ struct Stats {
 }
 
 impl Stats {
+    fn new() -> Self {
+        Self {
+            enabled: stats_on(),
+            ..Default::default()
+        }
+    }
+
+    /// Bump `counter` iff stats are enabled — every cache counter routes through
+    /// here so the disabled case costs one predictable branch, no shared write.
+    #[inline]
+    fn count(&self, counter: &AtomicU64) {
+        if self.enabled {
+            counter.fetch_add(1, Relaxed);
+        }
+    }
+
     /// One aperture was inserted: bump the global live count and the high-water mark.
     /// (Per-shard `map.len()` is no longer the global count, so we track it directly.)
     fn inc_live(&self) {
-        let n = self.live.fetch_add(1, Relaxed) + 1;
-        self.peak_live.fetch_max(n, Relaxed);
+        if self.enabled {
+            let n = self.live.fetch_add(1, Relaxed) + 1;
+            self.peak_live.fetch_max(n, Relaxed);
+        }
     }
 
     /// One aperture was evicted from a shard's map.
     fn dec_live(&self) {
-        self.live.fetch_sub(1, Relaxed);
+        if self.enabled {
+            self.live.fetch_sub(1, Relaxed);
+        }
     }
 
     /// Emit the counters as one structured `tracing` event (DEBUG, target
@@ -156,6 +186,42 @@ impl Stats {
     }
 }
 
+/// Hand-rolled multiply-mix hasher for the shard maps, replacing SipHash. The keys
+/// are page-aligned `(base, len)` pairs; a guest influencing which of ≤64 host-side
+/// buckets an entry lands in is harmless, so DoS-resistant hashing buys nothing on
+/// the 99.9% hit path.
+#[derive(Clone, Copy, Default)]
+struct PageHashBuilder;
+
+struct PageHasher(u64);
+
+impl std::hash::BuildHasher for PageHashBuilder {
+    type Hasher = PageHasher;
+    fn build_hasher(&self) -> PageHasher {
+        PageHasher(0)
+    }
+}
+
+impl std::hash::Hasher for PageHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Generic fallback — unused by the `(u64, u64)` key, kept total for safety.
+        for &b in bytes {
+            self.write_u64(b.into());
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        // splitmix64-style: multiply by a large odd constant, fold the high bits
+        // down so page-aligned keys (entropy in the middle bits) spread.
+        let x = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = x ^ (x >> 32);
+    }
+}
+
 /// One cached aperture mapping plus a recency stamp for LRU eviction.
 ///
 /// The aperture is held in an [`Arc`] so a lookup can hand out a cheap clone and the
@@ -163,43 +229,91 @@ impl Stats {
 /// cache's `Arc`, but the in-flight caller's clone keeps the mapping alive until the
 /// copy finishes (the actual unmap in `Aperture::drop` is deferred to the last
 /// holder). This is what makes the copy safe outside the lock.
-struct CachedAperture {
-    ap: Arc<Aperture>,
-    last_used: u64,
+///
+/// `last_used` is atomic so the **hit** path can restamp recency under the shard's
+/// *read* lock; only within-shard ordering matters (eviction is per-shard). Generic
+/// over the aperture handle (`A = Arc<Aperture>`) purely so eviction is unit-testable
+/// without a live HDV device.
+struct CachedEntry<A> {
+    ap: A,
+    last_used: AtomicU64,
 }
 
-/// On-demand cache of guest-memory apertures, keyed by the page-aligned
-/// `(base, len)` of the range mapped. One of [`SHARDS`] such shards; each is guarded
-/// by its own `Mutex` and carries its own LRU.
-#[derive(Default)]
-struct Cache {
-    map: HashMap<(u64, u64), CachedAperture>,
-    /// Monotonic recency clock for LRU.
-    clock: u64,
+/// The map inside one shard: page-aligned `(base, len)` → cached aperture.
+type ShardMap<A> = HashMap<(u64, u64), CachedEntry<A>, PageHashBuilder>;
+
+/// One of [`SHARDS`] independent slices of the on-demand aperture cache.
+///
+/// The hit path takes `cache` **shared** (`RwLock::read`) and bumps recency through
+/// the atomics; only miss / insert / evict takes it exclusively. The recency `clock`
+/// is per-shard, not global, because LRU only ever compares entries within one shard.
+struct Shard<A = Arc<Aperture>> {
+    cache: RwLock<ShardMap<A>>,
+    /// Monotonic recency clock for LRU, ticked outside the map lock.
+    clock: AtomicU64,
 }
 
-impl Cache {
-    /// Return the aperture covering a cached `(base, len)`, mapping it on demand.
+// Hand-rolled so `Shard<Arc<Aperture>>: Default` (derive would bound `A: Default`).
+impl<A> Default for Shard<A> {
+    fn default() -> Self {
+        Self {
+            cache: RwLock::new(HashMap::default()),
+            clock: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<A: Clone> Shard<A> {
+    /// The hit path: shared lock, atomic recency restamp, clone out.
+    ///
+    /// Poison-tolerant (as is every lock below): this runs on the un-guarded OpenVMM
+    /// worker threads, so a poisoned shard (from a panic already caught at a guarded
+    /// boundary) must not unwind here — the cache state is structurally valid.
+    fn lookup(&self, key: (u64, u64)) -> Option<A> {
+        let map = self.cache.read().unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(&key)?;
+        entry
+            .last_used
+            .store(self.clock.fetch_add(1, Relaxed) + 1, Relaxed);
+        Some(entry.ap.clone())
+    }
+
+    /// Drop the least-recently-used entry. If no other access still holds an `Arc`
+    /// clone, the entry's `Aperture` Drop unmaps it here; otherwise the unmap is
+    /// deferred until that in-flight copy releases its clone.
+    fn evict_one(map: &mut ShardMap<A>, stats: &Stats) {
+        if let Some((&key, _)) = map.iter().min_by_key(|(_, c)| c.last_used.load(Relaxed)) {
+            map.remove(&key);
+            stats.count(&stats.evicts);
+            stats.dec_live();
+        }
+    }
+}
+
+impl Shard<Arc<Aperture>> {
+    /// The miss path: map `(base, len)` on demand under the **write** lock.
     /// `err_addr` is the original access address, only for error reporting. The
     /// returned `Arc` keeps the mapping alive even if a later access evicts the
     /// cache entry, so the caller may copy through it without holding the lock.
     fn get_or_create(
-        &mut self,
+        &self,
         device: &hdv::Device,
         base: u64,
         len: u64,
         err_addr: u64,
         stats: &Stats,
     ) -> Result<Arc<Aperture>, GuestMemoryBackingError> {
-        self.clock += 1;
-        let now = self.clock;
-        if let Some(c) = self.map.get_mut(&(base, len)) {
-            c.last_used = now;
-            stats.hits.fetch_add(1, Relaxed);
+        let mut map = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.fetch_add(1, Relaxed) + 1;
+        // Re-check under the write lock: a concurrent miss on the same key can have
+        // inserted while we waited, and we must adopt that entry, not map a duplicate.
+        if let Some(c) = map.get(&(base, len)) {
+            c.last_used.store(now, Relaxed);
+            stats.count(&stats.hits);
             return Ok(c.ap.clone());
         }
-        if self.map.len() >= PER_SHARD_MAX {
-            self.evict_one(stats);
+        if map.len() >= PER_SHARD_MAX {
+            Self::evict_one(&mut map, stats);
         }
         // Map the range; on quota exhaustion, evict LRU and retry (bounded).
         let mut evictions = 0;
@@ -208,16 +322,16 @@ impl Cache {
                 Ok(ap) => break ap,
                 Err(e) => {
                     if e.0 as u32 != ERROR_NOT_ENOUGH_QUOTA
-                        || self.map.is_empty()
+                        || map.is_empty()
                         || evictions >= PER_SHARD_MAX
                     {
-                        stats.create_fails.fetch_add(1, Relaxed);
+                        stats.count(&stats.create_fails);
                         // Guest-triggerable (e.g. a descriptor into an unbacked range),
                         // so rate-limit it. hresult is structured for grepping.
                         crate::ratelimit::warn_ratelimited!(
                             gpa = base,
                             len,
-                            live = self.map.len(),
+                            live = map.len(),
                             hresult = e.0 as u32,
                             "HdvCreateGuestMemoryAperture failed"
                         );
@@ -226,35 +340,26 @@ impl Cache {
                             ApertureFailed(e.0),
                         ));
                     }
-                    stats.quota_retries.fetch_add(1, Relaxed);
-                    self.evict_one(stats);
+                    stats.count(&stats.quota_retries);
+                    Self::evict_one(&mut map, stats);
                     evictions += 1;
                 }
             }
         };
         let ap = Arc::new(ap);
-        self.map.insert(
+        map.insert(
             (base, len),
-            CachedAperture {
+            CachedEntry {
                 ap: ap.clone(),
-                last_used: now,
+                last_used: AtomicU64::new(now),
             },
         );
-        stats.creates.fetch_add(1, Relaxed);
-        stats.max_span.fetch_max(len, Relaxed);
+        stats.count(&stats.creates);
+        if stats.enabled {
+            stats.max_span.fetch_max(len, Relaxed);
+        }
         stats.inc_live();
         Ok(ap)
-    }
-
-    /// Drop the least-recently-used entry. If no other access still holds an `Arc`
-    /// clone, the entry's `Aperture` Drop unmaps it here; otherwise the unmap is
-    /// deferred until that in-flight copy releases its clone.
-    fn evict_one(&mut self, stats: &Stats) {
-        if let Some((&key, _)) = self.map.iter().min_by_key(|(_, c)| c.last_used) {
-            self.map.remove(&key);
-            stats.evicts.fetch_add(1, Relaxed);
-            stats.dec_live();
-        }
     }
 }
 
@@ -265,8 +370,9 @@ pub struct HdvApertureMem {
     /// Upper bound on valid guest physical addresses (the guest RAM size).
     max_address: u64,
     /// The aperture cache, split into [`SHARDS`] independently-locked shards so
-    /// concurrent accesses to different shards don't contend.
-    shards: [Mutex<Cache>; SHARDS],
+    /// concurrent accesses to different shards don't contend (and hits within one
+    /// shard share its read lock).
+    shards: [Shard; SHARDS],
     stats: Stats,
     /// Start instant + last-emit stamp (ms since start) for wall-clock-throttled
     /// stats, so even a stalled run that never reaches `STATS_EVERY` ops emits.
@@ -312,8 +418,8 @@ impl HdvApertureMem {
             Self {
                 handle,
                 max_address: ram_size_to_max_gpa(ram_size),
-                shards: std::array::from_fn(|_| Mutex::new(Cache::default())),
-                stats: Stats::default(),
+                shards: std::array::from_fn(|_| Shard::default()),
+                stats: Stats::new(),
                 start: Instant::now(),
                 last_emit_ms: AtomicU64::new(0),
             },
@@ -324,7 +430,7 @@ impl HdvApertureMem {
     /// Cheap on the hot path: a single relaxed add, then a clock read only when the
     /// op-count test misses.
     fn maybe_emit_stats(&self) {
-        if !stats_on() {
+        if !self.stats.enabled {
             return;
         }
         let n = self.stats.ops.fetch_add(1, Relaxed);
@@ -345,16 +451,17 @@ impl HdvApertureMem {
 
     /// The cache shard owning a page-aligned `base`. Routes by page number so
     /// consecutive pages spread across shards evenly.
-    fn shard(&self, base: u64) -> &Mutex<Cache> {
+    fn shard(&self, base: u64) -> &Shard {
         &self.shards[(base >> 12) as usize & (SHARDS - 1)]
     }
 
     /// Run `f` with a host pointer to guest physical `[addr, addr+len)`. The range
     /// is served by a single aperture covering its page-aligned span (mapped on
-    /// demand, cached, LRU-evicted). We hold the shard lock only for the cache
-    /// lookup; the `Arc<Aperture>` it returns keeps the mapping alive across `f`, so
-    /// the copy runs **without** the lock and can't be invalidated by a concurrent
-    /// eviction.
+    /// demand, cached, LRU-evicted). A hit holds the shard's **read** lock only long
+    /// enough to clone the `Arc` (recency is restamped atomically); a miss maps under
+    /// the write lock. Either way the `Arc<Aperture>` keeps the mapping alive across
+    /// `f`, so the copy runs **without** the lock and can't be invalidated by a
+    /// concurrent eviction.
     fn with_mapping<R>(
         &self,
         addr: u64,
@@ -362,15 +469,15 @@ impl HdvApertureMem {
         f: impl FnOnce(*mut u8) -> R,
     ) -> Result<R, GuestMemoryBackingError> {
         let device = self.handle.get().ok_or_else(|| {
-            self.stats.not_bound.fetch_add(1, Relaxed);
+            self.stats.count(&self.stats.not_bound);
             GuestMemoryBackingError::other(addr, NotBound)
         })?;
         let end = addr.checked_add(len as u64).ok_or_else(|| {
-            self.stats.bad_range.fetch_add(1, Relaxed);
+            self.stats.count(&self.stats.bad_range);
             GuestMemoryBackingError::other(addr, BadRange)
         })?;
         if end > self.max_address {
-            self.stats.bad_range.fetch_add(1, Relaxed);
+            self.stats.count(&self.stats.bad_range);
             // Guest-triggerable (a descriptor past guest RAM), so rate-limit it.
             crate::ratelimit::warn_ratelimited!(
                 gpa = addr,
@@ -388,13 +495,15 @@ impl HdvApertureMem {
         let span = (end - base).div_ceil(PAGE) * PAGE;
         let span = span.min(self.max_address - base); // clamp to guest RAM (page-aligned)
 
-        // Look up (or map) under the shard lock, then release it before copying.
-        // Poison-tolerant: this runs on the un-guarded OpenVMM worker thread, so a
-        // poisoned shard (from a panic already caught at a guarded boundary) must not
-        // unwind here — the cache state is structurally valid.
-        let ap = {
-            let mut cache = self.shard(base).lock().unwrap_or_else(|e| e.into_inner());
-            cache.get_or_create(&device, base, span, addr, &self.stats)?
+        // Hit: shard read lock only (the 99.9% path). Miss: write lock + map inside
+        // `get_or_create`. Either way the lock is released before the copy below.
+        let shard = self.shard(base);
+        let ap = match shard.lookup((base, span)) {
+            Some(ap) => {
+                self.stats.count(&self.stats.hits);
+                ap
+            }
+            None => shard.get_or_create(&device, base, span, addr, &self.stats)?,
         };
         let host_base = ap.as_ptr() as usize;
         // SAFETY: `addr..end` lies within `[base, base+span)` mapped by `ap`. The
@@ -412,7 +521,7 @@ impl HdvApertureMem {
 
 impl Drop for HdvApertureMem {
     fn drop(&mut self) {
-        if stats_on() {
+        if self.stats.enabled {
             self.stats.emit("final");
         }
     }
@@ -519,5 +628,63 @@ unsafe impl GuestMemoryAccess for HdvApertureMem {
             Err(e) => tracing::trace!("write_guest gpa={addr:#x} len={len} FAILED: {e:?}"),
         }
         r
+    }
+}
+
+#[cfg(test)]
+impl<A: Clone> Shard<A> {
+    /// Test-only insert mirroring the miss path's evict-if-full + recency stamp,
+    /// without needing a live HDV device to create real apertures.
+    fn insert(&self, key: (u64, u64), value: A, stats: &Stats) {
+        let mut map = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.fetch_add(1, Relaxed) + 1;
+        if map.len() >= PER_SHARD_MAX {
+            Self::evict_one(&mut map, stats);
+        }
+        map.insert(
+            key,
+            CachedEntry {
+                ap: value,
+                last_used: AtomicU64::new(now),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filling a shard past `PER_SHARD_MAX` evicts exactly the least-recently-used
+    /// entry — including when a read-path `lookup` (not an insert) refreshed it.
+    #[test]
+    fn shard_evicts_lru_past_cap() {
+        let shard: Shard<u64> = Shard::default();
+        let stats = Stats::new();
+        for i in 0..PER_SHARD_MAX as u64 {
+            shard.insert((i * PAGE, PAGE), i, &stats);
+        }
+        // Touch the oldest entry through the hit path; entry 1 becomes the LRU.
+        assert_eq!(shard.lookup((0, PAGE)), Some(0));
+        shard.insert((4096 * PAGE, PAGE), 4096, &stats);
+        let map = shard.cache.read().unwrap();
+        assert_eq!(map.len(), PER_SHARD_MAX);
+        assert!(map.contains_key(&(0, PAGE)), "refreshed entry must survive");
+        assert!(
+            !map.contains_key(&(PAGE, PAGE)),
+            "LRU entry must be evicted"
+        );
+        assert!(map.contains_key(&(4096 * PAGE, PAGE)));
+    }
+
+    /// The multiply-mix hasher must spread consecutive page-aligned keys (the real
+    /// key distribution) without collisions.
+    #[test]
+    fn page_hasher_spreads_consecutive_pages() {
+        use std::hash::BuildHasher;
+        let hashes: std::collections::HashSet<u64> = (0..1024)
+            .map(|i| PageHashBuilder.hash_one((i * PAGE, PAGE)))
+            .collect();
+        assert_eq!(hashes.len(), 1024);
     }
 }
