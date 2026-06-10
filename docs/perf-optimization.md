@@ -30,11 +30,14 @@ using it.
 | **A′** ✅ | Aperture hit-path: `RwLock` + atomic recency + gated stats + fast hasher | `mem.rs` | done — baseline 3/3 clean, no regression |
 | **A** ✅ | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete, + adaptive inline at QD 1 | `offload.rs`, `pool.rs`, `payload.rs` | done — e2e 8/8 green; +47–103% at depth, QD-1 parity ([results](#measured-outcome-2026-06-10)) |
 | **R** ✅ | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | done — rode with A |
-| **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision |
-| **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | guest kernel ≥ 6.10 |
+| **P** ✅ | Request-path stage profiling (`VIRTIO_HDV_REQ_STATS`) | `reqstats.rs` | done — [profile](#where-the-residual-microseconds-go-request-path-profile-2026-06-10) |
+| **K** ⛔ | Queue kicks via HDV doorbells (skip the MMIO-intercept round trip) | `doorbell.rs` | platform-blocked: `E_ACCESSDENIED` on restricted hosts; kept as auto-fallback |
+| **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision — **now the top lever** (fewer ops beats cheaper ops; per-op floor is platform-bound) |
+| **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | de-prioritised — profile shows the dispatcher is nowhere near binding |
+| ~~MSI batch~~ | ~~one MSI per completion drain~~ | — | dropped — ≤9 µs × 80% of ops, QD>1 only; invisible where the ceiling lives |
 | ~~C~~ | ~~async lxutil~~ | — | dropped — A makes it moot |
 
-Order: **A′ ✅ → A (+R) ✅ → measured ✅ → decide E/D → maybe B / profile the residual serial cost.**
+Order: **A′ ✅ → A (+R) ✅ → measured ✅ → profile ✅ → doorbell ⛔ → decide E/D → (parked: broker-side doorbells, B).**
 
 ## Measured outcome (2026-06-10)
 
@@ -64,9 +67,69 @@ What the campaign established:
 3. **The residual ceiling is the still-serial per-op path**, not FUSE dispatch: the one
    dispatcher task does pop + complete + one `HdvDeliverGuestInterrupt` per completion,
    and every request crosses the aperture fallback several times (descriptor read,
-   payload read, reply write, used-ring write). Next levers, in rough order of expected
-   value: profile that per-op host path; batch/coalesce completions (one MSI per drain,
-   not per op); **B** (multiqueue = more dispatchers); **E/D** remain policy-gated.
+   payload read, reply write, used-ring write). The profile below decomposed it.
+
+## Where the residual microseconds go (request-path profile, 2026-06-10)
+
+`VIRTIO_HDV_REQ_STATS=1` (`reqstats.rs`, `run-perf-baseline.ps1 -ReqStats`) times every
+host-side stage of a request; zero overhead when off (bench at parity with stats on).
+Captured at `workers=8`, 84k ops across all phases (91% lone batches = QD-1 dominated):
+
+| stage | mean | n | what it is |
+|---|---:|---:|---|
+| pop (`try_next` drain) | 1 µs | 74k | descriptor + payload reads via aperture hits |
+| FUSE dispatch, inline (QD-1) | 20 µs | 64k | parse + host-FS call + reply write |
+| FUSE dispatch, pool (parallel) | 32 µs | 21k | same, under host-FS concurrency |
+| pool_wait + done_hop | 6 + 8 µs | 21k | the thread-hop tax (pool path only) |
+| complete (used-ring write + MSI) | 8 µs | 84k | |
+| `HdvDeliverGuestInterrupt` alone | 9 µs | 67k | **delivers/ops = 80%** — event_idx suppresses only 20% |
+
+Host-side total per QD-1 op ≈ **30 µs**. The cleanest serial yardstick — `seqwrite_4k`
+at 41 MB/s ≈ 10.6k ops/s ≈ **95 µs/op** — leaves **~65 µs/op outside every measured host
+stage**: the guest driver plus the **kick path** (a BAR0 MMIO write delivered as a guest
+exit + cross-process HDV vtable call into `write_bar`) plus the IOCP wake. Consequences:
+
+- **Not dispatcher-bound**: the dispatcher's serial budget is ~10 µs/op (~100k ops/s
+  ceiling) vs 13k observed at depth → **B (multiqueue) is not the next lever**.
+- **Not MSI-bound**: batching one MSI per drain would save ≤9 µs on 80% of ops, only at
+  QD>1 → **dropped**.
+- The kick path is the dominant non-FS cost → the doorbell experiment below.
+
+### Doorbell experiment (K) — platform-blocked, kept as auto-fallback
+
+`doorbell.rs` implements OpenVMM's `DoorbellRegistration` seam on `HdvRegisterDoorbell`
+(the VID consumes the guest's notify write **in kernel** and signals the queue event
+directly — deleting the user-mode intercept round trip per request). Getting the
+transport to even *attempt* registration surfaced two config-emulator truths worth
+keeping (both fixed in `lib.rs`):
+
+1. **The VID owns the guest-facing config space**: the guest's command-register write
+   never reaches `write_config`, so the internal emulator never saw memory-space decode
+   enabled, `bar_address(0)` stayed `None`, and `install_doorbells` silently no-oped.
+   Fixed by enabling decode (bit 1 only — pre-enabled bus master makes the VID reject
+   the device) right after `HdvCreateDeviceInstance`.
+2. **The VID re-calls `GetDetails` at FlexibleIov hot-add**, and `pci_core` ignores BAR
+   writes while decode is on — so the BAR-sizing probe must clear/restore the command
+   register around itself or enumeration breaks (observed: guest boots, share never
+   mounts).
+
+Outcome: `HdvRegisterDoorbell` → **`E_ACCESSDENIED (0x80070005)`** on our
+`ExternalRestricted` device host. This is structural, not a bug: WSL's own restricted
+device host never calls it either — doorbells are registered by the **privileged
+broker** (`DeviceHostProxy.cpp`: `vmwpctrl.dll!GetVmWorkerProcess` →
+`IVmVirtualDeviceAccess::GetDevice` → `IVmFiovGuestMemoryFastNotification::RegisterDoorbell`).
+The code stays in, default-on with a `VIRTIO_HDV_DOORBELL=0` kill switch: registration
+failure falls back to the MMIO intercept transparently (verified — baseline 3/3 at
+parity, e2e green), and it lights up automatically in any process where HDV grants it.
+
+**Future route (parked):** the C-ABI **consumer** owns the compute system, so it (or a
+helper we ship) could register doorbells broker-style via the `vmwpctrl` COM interfaces
+and hand us the event — a new ABI surface; needs a design pass.
+
+**Re-ranked next levers:** with the per-op floor platform-bound at ~65 µs, making ops
+*cheaper* is capped — making them *fewer* is not. **E/D** (guest-side attr/entry caching,
+writeback) directly removes round trips and is now the top item, pending the coherence
+policy decision. B and MSI batching stay parked on the profile's evidence.
 
 ---
 

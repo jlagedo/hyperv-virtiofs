@@ -65,6 +65,13 @@ system volume). Override with `-WorkspaceDir <path>` / `HVFS_PB_WS` to test a sp
 Tunables (env, or the script params): `HVFS_PB_SEQMB`, `HVFS_PB_META`, `HVFS_PB_RAND`,
 `HVFS_PB_REPEATS`, `HVFS_PB_WS`.
 
+Host-side diagnostics (each also has a script switch): `VIRTIO_HDV_APERTURE_STATS`
+(`-ApertureStats`, aperture-cache counters) and `VIRTIO_HDV_REQ_STATS` (`-ReqStats`,
+per-stage request-path timings — offload device only, so pair with `VIRTIO_HDV_WORKERS`;
+see `perf-optimization.md` → *Where the residual microseconds go*). `VIRTIO_HDV_DOORBELL=0`
+forces the MMIO-intercept kick path (doorbell registration is platform-denied on
+restricted device hosts anyway; the env var pins the fallback for A/B runs).
+
 ## Results
 
 Capture: **2026-06-03**, Win11 26200, `seqmb=64 meta=1000 rand=300`, **3/3 runs clean**. Share

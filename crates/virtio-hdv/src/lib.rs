@@ -16,13 +16,15 @@
 //!
 //! **Scope (milestone 2, first proof):** no DAX — `shmem_size = 0`, so there is
 //! no shared-memory BAR and no `shared_mem_mapper` / `HdvCreateSectionBackedMmioRange`
-//! on the critical path. Notify rides the BAR0 MMIO intercept (no doorbell yet).
-//! Both are deliberate simplifications, documented inline.
+//! on the critical path — a deliberate simplification, documented inline. Queue
+//! notify uses HDV doorbells ([`doorbell`]), falling back to the BAR0 MMIO
+//! intercept when registration fails or `VIRTIO_HDV_DOORBELL=0`.
 //!
 //! [`VirtioPciDevice`]: virtio::VirtioPciDevice
 //! [`VirtioFsDevice`]: virtiofs::virtio::VirtioFsDevice
 //! [`VirtioFs`]: virtiofs::VirtioFs
 
+mod doorbell;
 mod handle;
 mod interrupt;
 mod mem;
@@ -249,12 +251,22 @@ impl VirtioHdvDevice {
             Box::new(VirtioFsDevice::new(&driver_source, tag, fs, 0, None))
         };
 
+        // Queue kicks: HDV doorbells (kernel-signaled queue events) by default;
+        // VIRTIO_HDV_DOORBELL=0 — or a failing HdvRegisterDoorbell — falls back
+        // to the BAR0 MMIO intercept (a user-mode round trip per kick). See
+        // `doorbell.rs` for the profile that motivated this.
+        let doorbells: Option<Arc<dyn guestmem::DoorbellRegistration>> =
+            doorbell::enabled().then(|| {
+                Arc::new(doorbell::HdvDoorbells::new(handle.clone()))
+                    as Arc<dyn guestmem::DoorbellRegistration>
+            });
+
         let mut pci_dev = VirtioPciDevice::new(
             fs_device,
             &driver,
             guest_memory,
             PciInterruptModel::Msix(msi_conn.target()),
-            None,                                 // no doorbell: notify via BAR0 MMIO intercept
+            doorbells,
             &mut ExternallyManagedMmioIntercepts, // HDV owns BAR placement; we route by (bar,offset)
             None,                                 // no shared-memory mapper (shmem_size == 0)
         )
@@ -293,6 +305,8 @@ impl VirtioHdvDevice {
             .await
         });
 
+        // Kept past `ops` for the post-create decode enable below.
+        let cfg_dev = dev.clone();
         let ops = Ops {
             dev,
             _pool_thread: pool_thread,
@@ -306,6 +320,25 @@ impl VirtioHdvDevice {
             .map_err(AttachError::Hdv)?;
         // Now the guest-memory + MSI seams can reach the device.
         handle.set(pci.device());
+
+        // Enable memory-space decode in the *internal* config emulator. The VID
+        // owns the guest-facing config space, so the guest's real command-
+        // register write never reaches `write_config` — without this the
+        // emulator never parses its BAR mappings and `bar_address(0)`, which
+        // `install_doorbells` keys off at guest DRIVER_OK, stays `None`,
+        // silently disabling HDV doorbell registration. Decode state is
+        // invisible to the guest (HDV routes MMIO by `(bar, offset)`
+        // regardless). It must happen *after* create: the emulator ignores BAR
+        // writes while decode is on, which would break the `details()` sizing
+        // probe; and only memory space (bit 1) is set — pre-enabling bus
+        // master (bit 2) makes the VID reject the device. Plain write, not
+        // read-modify-write: offset 4 reads back status<<16, whose
+        // write-1-to-clear bits must not be echoed.
+        cfg_write(
+            &mut cfg_dev.lock().unwrap_or_else(|e| e.into_inner()),
+            0x04,
+            0x2,
+        );
 
         // Start the interrupt re-arm net only after the handle is bound.
         let rearm = RearmNet::spawn(handle, seen);
@@ -341,6 +374,16 @@ impl PciOps for Ops {
 
         // Standard PCI BAR sizing: write all-ones, read back the size mask,
         // restore. HDV uses these to allocate the BARs' guest address space.
+        //
+        // The probe only works with memory-space decode OFF — the emulator
+        // deliberately ignores BAR writes while decode is on — and we enable
+        // decode right after create (see `attach_shared`), while the VID can
+        // call `GetDetails` again later (observed at FlexibleIov hot-add).
+        // Clear the command register around the probe and restore it after,
+        // masking off the status half (write-1-to-clear bits must not be
+        // echoed back).
+        let cmd = cfg_read(&mut dev, 0x04) & 0xFFFF;
+        cfg_write(&mut dev, 0x04, 0);
         let mut probed = [0u32; 6];
         for (i, slot) in probed.iter_mut().enumerate() {
             let off = 0x10 + (i as u16) * 4;
@@ -349,6 +392,7 @@ impl PciOps for Ops {
             *slot = cfg_read(&mut dev, off);
             cfg_write(&mut dev, off, orig);
         }
+        cfg_write(&mut dev, 0x04, cmd);
 
         PciDetails {
             vendor_id: id as u16,
@@ -455,8 +499,8 @@ fn cfg_write(dev: &mut VirtioPciDevice, off: u16, val: u32) {
 /// to avoid colliding with anything the emulator inspects.
 /// Internal BAR bases for `find_bar` routing — never seen by the guest (the VID
 /// places the guest-facing BARs out-of-band). Page-aligned, non-overlapping.
-const BAR0_BASE: u64 = 0x1_0000_0000;
-const BAR2_BASE: u64 = 0x1_0000_1000;
+pub(crate) const BAR0_BASE: u64 = 0x1_0000_0000;
+pub(crate) const BAR2_BASE: u64 = 0x1_0000_1000;
 
 /// Program the internal BAR bases (BAR0/BAR2, 64-bit memory BARs → two dwords
 /// each) into the config emulator. Leaves the command register alone — the guest
