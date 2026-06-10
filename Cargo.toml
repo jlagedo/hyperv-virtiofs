@@ -27,6 +27,8 @@ rust-version = "1.95"
 [workspace.dependencies]
 virtio = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 virtiofs = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+fuse = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
+lx = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 pci_core = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 chipset_device = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }
 guestmem = { git = "https://github.com/microsoft/openvmm", rev = "3d1207b5cc9a7d833f0b0f646342fe5fdd81ebec" }

@@ -26,6 +26,12 @@
 mod handle;
 mod interrupt;
 mod mem;
+// Strategy A building blocks (docs/perf-optimization.md); consumed by the
+// offload device in A2 — the dead_code allows go away with it.
+#[allow(dead_code)]
+mod payload;
+#[allow(dead_code)]
+mod pool;
 mod ratelimit;
 
 pub use handle::DeviceHandle;

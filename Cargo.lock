@@ -1689,11 +1689,13 @@ name = "virtio-hdv"
 version = "0.1.0"
 dependencies = [
  "chipset_device",
+ "fuse",
  "futures",
  "guestmem",
  "hdv",
  "hdv-sys",
  "inspect",
+ "lx",
  "pal_async",
  "pal_event",
  "pci_core",
