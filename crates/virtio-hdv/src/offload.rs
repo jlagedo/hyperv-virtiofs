@@ -19,6 +19,13 @@
 //! finishes first — out-of-order is spec-legal (`VIRTIO_F_IN_ORDER` is never
 //! advertised) and both ring formats carry the work item's own id.
 //!
+//! **Adaptive inline.** The pool's thread-hop (~tens of µs per request) only
+//! pays off when requests overlap. At queue depth 1 — every single-threaded
+//! guest workload — it is pure added latency, so a lone request on an
+//! otherwise-idle queue is dispatched inline on the dispatcher task (exactly
+//! the upstream serial device's behaviour); the pool engages only when a
+//! drained batch exceeds one or work is already in flight.
+//!
 //! **Lock/borrow rule (the correctness crux):** never hold a queue borrow
 //! across an `.await`. The `poll_fn` closure borrows the queue only inside
 //! each poll; `try_next` drains synchronously between polls.
@@ -228,6 +235,9 @@ impl Dispatcher {
     async fn run(mut self, mut stop_rx: oneshot::Receiver<()>) -> VirtioQueue {
         let (done_tx, mut done_rx) = mpsc::unbounded::<(VirtioQueueCallbackWork, u32)>();
         let mut inflight: usize = 0;
+        // Reused drain buffer: popping the batch before dispatching is what
+        // lets us see its size (the adaptive-inline test below).
+        let mut batch: Vec<VirtioQueueCallbackWork> = Vec::new();
         // Stop requested: pop nothing more, drain completions to zero, return.
         let mut stopping = false;
         // Queue error (guest corruption): pop nothing more, but keep
@@ -240,30 +250,7 @@ impl Dispatcher {
             if !stopping && !failed {
                 loop {
                     match self.queue.try_next() {
-                        Ok(Some(work)) => {
-                            inflight += 1;
-                            let mem = self.mem.clone();
-                            let session = self.session.clone();
-                            let notify = self.notify_corruption.clone();
-                            let done = done_tx.clone();
-                            self.pool.submit(Box::new(move || {
-                                // Contain panics *here* (not just in the pool)
-                                // so `work` always flows back: a lost work item
-                                // is a descriptor that never completes — a
-                                // guest request that hangs forever.
-                                let bytes =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        dispatch_one(&session, &mem, &work, &*notify)
-                                    }))
-                                    .unwrap_or_else(|_| {
-                                        crate::ratelimit::warn_ratelimited!(
-                                            "panic in FUSE dispatch (contained); completing 0 bytes"
-                                        );
-                                        0
-                                    });
-                                let _ = done.unbounded_send((work, bytes));
-                            }));
-                        }
+                        Ok(Some(work)) => batch.push(work),
                         Ok(None) => break,
                         Err(err) => {
                             tracing::error!(
@@ -275,6 +262,55 @@ impl Dispatcher {
                         }
                     }
                 }
+            }
+
+            // 2a. Adaptive inline: a lone request on an otherwise-idle queue
+            //     (queue depth 1 — every single-threaded guest workload) runs
+            //     right here on the dispatcher task, exactly like the upstream
+            //     serial device. The pool's thread-hop only buys anything when
+            //     there is a second request to overlap with; at QD=1 it is
+            //     pure added latency (measured ~10% on 4k/metadata).
+            if inflight == 0 && batch.len() == 1 {
+                let work = batch.pop().expect("len == 1");
+                // Same panic containment as the pool path: complete with 0
+                // bytes rather than losing the descriptor.
+                let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_one(&self.session, &self.mem, &work, &*self.notify_corruption)
+                }))
+                .unwrap_or_else(|_| {
+                    crate::ratelimit::warn_ratelimited!(
+                        "panic in FUSE dispatch (contained); completing 0 bytes"
+                    );
+                    0
+                });
+                self.queue.complete(work, bytes);
+                // Anything that arrived while we were blocked is picked up by
+                // the next drain — and, being a batch > 1, goes to the pool.
+                continue;
+            }
+
+            // 2b. Fan the batch out to the pool.
+            for work in batch.drain(..) {
+                inflight += 1;
+                let mem = self.mem.clone();
+                let session = self.session.clone();
+                let notify = self.notify_corruption.clone();
+                let done = done_tx.clone();
+                self.pool.submit(Box::new(move || {
+                    // Contain panics *here* (not just in the pool) so `work`
+                    // always flows back: a lost work item is a descriptor that
+                    // never completes — a guest request that hangs forever.
+                    let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_one(&session, &mem, &work, &*notify)
+                    }))
+                    .unwrap_or_else(|_| {
+                        crate::ratelimit::warn_ratelimited!(
+                            "panic in FUSE dispatch (contained); completing 0 bytes"
+                        );
+                        0
+                    });
+                    let _ = done.unbounded_send((work, bytes));
+                }));
             }
             if stopping && inflight == 0 {
                 return self.queue;
