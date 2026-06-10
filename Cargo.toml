@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/hdv-sys",
+    "crates/vmworker-sys",
     "crates/hdv",
     "crates/virtio-hdv",
     "crates/hyperv_virtiofs",

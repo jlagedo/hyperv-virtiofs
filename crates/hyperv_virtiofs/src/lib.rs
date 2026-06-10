@@ -37,8 +37,9 @@
 mod logging;
 
 use hcs_sys::{
-    HcsCloseComputeSystem, HcsCloseOperation, HcsCreateOperation, HcsModifyComputeSystem,
-    HcsOpenComputeSystem, HcsWaitForOperationResult, GENERIC_ALL, HCS_SYSTEM,
+    HcsCloseComputeSystem, HcsCloseOperation, HcsCreateOperation, HcsGetComputeSystemProperties,
+    HcsModifyComputeSystem, HcsOpenComputeSystem, HcsWaitForOperationResult, GENERIC_ALL,
+    HCS_SYSTEM,
 };
 use hdv::pci::{guid_from_string, guid_to_string, HVFS_DEVICE_HOST_ID, VIRTIO_FS_DEVICE_CLASS_ID};
 use hdv::proxy::DeviceHostSupport;
@@ -188,6 +189,60 @@ unsafe fn hcs_modify(system: HCS_SYSTEM, request: &str) -> Result<(), i32> {
     }
 }
 
+/// Query the compute system's **runtime id** — the VM worker process identity
+/// `GetVmWorkerProcess` wants (distinct from the configuration GUID). Best-effort:
+/// `None` (with a warn) degrades doorbells to the MMIO-intercept kick path, it
+/// never fails the share.
+///
+/// # Safety
+/// `system` must be a live compute-system handle for the duration of the call.
+unsafe fn hcs_runtime_id(system: HCS_SYSTEM) -> Option<hdv::GUID> {
+    // SAFETY: `system` is live (caller contract); `op` is created/closed here;
+    // `result` is read before the call returns.
+    let doc = unsafe {
+        let op = HcsCreateOperation(ptr::null(), None);
+        if op.is_null() {
+            tracing::warn!("HcsCreateOperation failed querying RuntimeId");
+            return None;
+        }
+        let hr = HcsGetComputeSystemProperties(system, op, ptr::null());
+        let mut result: hcs_sys::PWSTR = ptr::null_mut();
+        let whr = HcsWaitForOperationResult(op, 30_000, &mut result);
+        HcsCloseOperation(op);
+        if hr < 0 || whr < 0 || result.is_null() {
+            tracing::warn!(
+                hr = format_args!("{:#010x}", hr as u32),
+                whr = format_args!("{:#010x}", whr as u32),
+                "HcsGetComputeSystemProperties failed; doorbells stay on the MMIO intercept"
+            );
+            return None;
+        }
+        // Copy out the NUL-terminated UTF-16 result document, then free the
+        // HCS-allocated buffer (the HcsWaitForOperationResult contract).
+        let mut len = 0usize;
+        while *result.add(len) != 0 {
+            len += 1;
+        }
+        let doc = String::from_utf16_lossy(std::slice::from_raw_parts(result, len));
+        hcs_sys::LocalFree(result.cast());
+        doc
+    };
+
+    let props: serde_json::Value = match serde_json::from_str(&doc) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "compute-system properties: bad JSON");
+            return None;
+        }
+    };
+    let id = props.get("RuntimeId").and_then(|v| v.as_str())?;
+    let guid = guid_from_string(id);
+    if guid.is_none() {
+        tracing::warn!(runtime_id = id, "RuntimeId is not a parseable GUID");
+    }
+    guid
+}
+
 /// RAII for an opened `HCS_SYSTEM`: closes it on drop, so every early return in
 /// [`hvfs_host_open`] releases the handle and the host's teardown closes it last.
 struct OwnedSystem(HCS_SYSTEM);
@@ -221,11 +276,30 @@ pub struct hvfs_host {
     owned: OwnedSystem,
     /// Per-device aperture ceiling (the compute system's RAM in bytes).
     memory_bytes: u64,
+    /// The system's `RuntimeId`, queried lazily (the VM worker exists once the
+    /// system runs — i.e. by [`hvfs_add_share`] time) and cached. `None` until
+    /// then, or if the query failed (doorbells then stay on the MMIO intercept).
+    runtime_id: Mutex<Option<hdv::GUID>>,
 }
 
 impl hvfs_host {
     fn system(&self) -> HCS_SYSTEM {
         self.owned.0
+    }
+
+    /// The cached `RuntimeId`, querying it on first use. A failed query is
+    /// retried on the next share (transient HCS errors shouldn't pin a host
+    /// to the slow kick path forever).
+    fn runtime_id(&self) -> Option<hdv::GUID> {
+        let mut cached = self
+            .runtime_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cached.is_none() {
+            // SAFETY: the system handle is live while `self` exists.
+            *cached = unsafe { hcs_runtime_id(self.system()) };
+        }
+        *cached
     }
 }
 
@@ -344,6 +418,7 @@ pub unsafe extern "C" fn hvfs_host_open(
             _support: support,
             owned,
             memory_bytes: cfg.memory_mb.saturating_mul(1024 * 1024),
+            runtime_id: Mutex::new(None),
         });
         tracing::info!(system = %id, memory_mb = cfg.memory_mb, "device host registered");
         // SAFETY: `out` checked non-null above and guaranteed writable by the caller.
@@ -427,6 +502,9 @@ pub unsafe extern "C" fn hvfs_add_share(
             h.memory_bytes,
             &VIRTIO_FS_DEVICE_CLASS_ID,
             &instance_guid,
+            // The VM worker doorbell route (docs/perf-optimization.md K2); None
+            // degrades queue kicks to the MMIO intercept.
+            h.runtime_id(),
         ) {
             Ok(d) => d,
             Err(e) => {

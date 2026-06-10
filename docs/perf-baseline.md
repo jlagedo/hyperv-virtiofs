@@ -69,8 +69,9 @@ Host-side diagnostics (each also has a script switch): `VIRTIO_HDV_APERTURE_STAT
 (`-ApertureStats`, aperture-cache counters) and `VIRTIO_HDV_REQ_STATS` (`-ReqStats`,
 per-stage request-path timings — offload device only, so pair with `VIRTIO_HDV_WORKERS`;
 see `perf-optimization.md` → *Where the residual microseconds go*). `VIRTIO_HDV_DOORBELL=0`
-forces the MMIO-intercept kick path (doorbell registration is platform-denied on
-restricted device hosts anyway; the env var pins the fallback for A/B runs).
+forces the MMIO-intercept kick path — kernel doorbells are **on** by default via the VM-worker
+channel (`perf-optimization.md` → *K2 landed*; A/B measured **seqwrite_4k +65%**), so the env
+var is the switch for re-measuring the slow path.
 
 ## Results
 

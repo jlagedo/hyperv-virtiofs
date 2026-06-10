@@ -31,15 +31,15 @@ using it.
 | **A** ✅ | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete, + adaptive inline at QD 1 | `offload.rs`, `pool.rs`, `payload.rs` | done — e2e 8/8 green; +47–103% at depth, QD-1 parity ([results](#measured-outcome-2026-06-10)) |
 | **R** ✅ | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | done — rode with A |
 | **P** ✅ | Request-path stage profiling (`VIRTIO_HDV_REQ_STATS`) | `reqstats.rs` | done — [profile](#where-the-residual-microseconds-go-request-path-profile-2026-06-10) |
-| **K** ⛔ | Queue kicks via **HDV** doorbells (`HdvRegisterDoorbell`) | `doorbell.rs` | platform-blocked: `E_ACCESSDENIED` on restricted hosts (by design). Kept as auto-fallback; superseded by **K2** |
-| **K2** 🎯 | Queue kicks via the **VM-worker** channel (`GetVmWorkerProcess` → `IVmFiovGuestMemoryFastNotification::RegisterDoorbell`) | `vmworker-sys` (new) + `doorbell.rs` | **top lever** — researched & viable ([writeup](#the-vm-worker-channel--the-real-doorbell-route-and-dax--2026-06-10)); needs a ~1-day rig spike |
+| **K** ⛔ | Queue kicks via **HDV** doorbells (`HdvRegisterDoorbell`) | `doorbell.rs` | platform-blocked: `E_ACCESSDENIED` on restricted hosts (by design). Kept as the first auto-attempt; falls through to **K2** |
+| **K2** ✅ | Queue kicks via the **VM-worker** channel (`GetVmWorkerProcess` → `IVmFiovGuestMemoryFastNotification::RegisterDoorbell`) | `vmworker-sys` (new), `hdv::vmworker`, `doorbell.rs` | **done — landed & measured**: registers `S_OK`, **seqwrite_4k +65%, seqread_cold_4k +96%** ([outcome](#k2-landed--the-vm-worker-doorbell-2026-06-10)) |
+| **DAX** | Section-backed BAR via `IVmFiovGuestMmioMappings::CreateSectionBackedMmioRange` (same channel as K2) | `vmworker-sys` + `mem.rs` | the read/mmap order-of-magnitude lever; **K2 already built the plumbing** (the interface is declared, unused) |
 | **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision — strong independent lever (removes round trips) |
-| **DAX** | Section-backed BAR via `IVmFiovGuestMmioMappings::CreateSectionBackedMmioRange` (same channel as K2) | `vmworker-sys` + `mem.rs` | the read/mmap order-of-magnitude lever; rides K2's plumbing |
 | **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | de-prioritised — profile shows the dispatcher is nowhere near binding |
 | ~~MSI batch~~ | ~~one MSI per completion drain~~ | — | dropped — ≤9 µs × 80% of ops, QD>1 only; invisible where the ceiling lives |
 | ~~C~~ | ~~async lxutil~~ | — | dropped — A makes it moot |
 
-Order: **A′ ✅ → A (+R) ✅ → measured ✅ → profile ✅ → HDV doorbell ⛔ → research VM-worker channel ✅ → K2 spike (next) → E/D / DAX.**
+Order: **A′ ✅ → A (+R) ✅ → measured ✅ → profile ✅ → HDV doorbell ⛔ → research VM-worker channel ✅ → K2 landed ✅ → E/D / DAX (next).**
 
 ## Measured outcome (2026-06-10)
 
@@ -127,8 +127,9 @@ parity, e2e green), and it lights up automatically in any process where HDV gran
 **The real route — not parked, just relocated:** the doorbell `E_ACCESSDENIED` is a
 signpost, not a wall. The owner side of the VM *can* register doorbells through the VM
 worker process, and we are the owner. The deep dive into WSL source + Microsoft Learn +
-observed platform behaviour is written up in full below — it is the highest-value remaining
-lever and it also unlocks DAX.
+observed platform behaviour is written up in full below — and it is now **built, measured,
+and landed** ([K2 landed](#k2-landed--the-vm-worker-doorbell-2026-06-10): seqwrite_4k +65%).
+It also unlocks DAX.
 
 ---
 
@@ -226,23 +227,76 @@ one piece of COM plumbing unlocks **both** remaining heavyweight levers: the doo
   bounded `unsafe`; fits our `*-sys` / safe-wrapper layering (a new `vmworker-sys` + thin safe
   wrapper). No new external crates.
 
-### Proposed spike (before committing the feature)
-
-~1 day on the rig: thread the runtime ID in; add `vmworker-sys` (`GetVmWorkerProcess` + the
-three COM interfaces with the correct vtable layout); in `doorbell.rs`'s `E_ACCESSDENIED`
-branch, try the worker path. **Success = registration returns `S_OK` *and* the request-path
-profile (`VIRTIO_HDV_REQ_STATS`) shows the kick/deliver cost dropping** — the proof the doorbell
-is live, not just accepted. If it works, the same shim is ~80% of the DAX groundwork.
-
 ### Re-ranked levers (supersedes the profile's first cut)
 
-1. **VM-worker doorbell** (this section) — directly attacks the platform-bound ~65 µs kick
-   floor, documented-enough that Microsoft's own product depends on it. **Top lever.**
+1. ~~**VM-worker doorbell**~~ — **done** ([outcome below](#k2-landed--the-vm-worker-doorbell-2026-06-10)).
 2. **E/D** (guest attr/entry caching + writeback) — removes round trips entirely; still
-   valuable and independent of the above, pending the coherence-policy decision.
-3. **DAX** via `IVmFiovGuestMmioMappings` — same channel as #1; the read/mmap order-of-magnitude
-   lever, now with a concrete API.
+   valuable and independent of the above, pending the coherence-policy decision. **Now the top
+   open lever.**
+3. **DAX** via `IVmFiovGuestMmioMappings` — same channel K2 already plumbed; the read/mmap
+   order-of-magnitude lever. The interface is declared in `vmworker-sys` (unused) ready to wire.
 4. ~~B (multiqueue)~~, ~~MSI batch~~ — stay parked; the profile shows neither is binding.
+
+---
+
+## K2 landed — the VM-worker doorbell (2026-06-10)
+
+Built and verified on the rig. Queue kicks now bypass the user-mode MMIO intercept: the VID
+consumes the guest's notify write **in kernel** and signals the queue event directly.
+
+### Result — same-host A/B (`VIRTIO_HDV_DOORBELL` on vs `=0`, 1 run each, serial device)
+
+| metric (QD-1) | doorbell off (MMIO intercept) | doorbell on (VM-worker) | Δ |
+|---|---:|---:|---:|
+| seqwrite_4k | 43 MB/s | **71 MB/s** | **+65%** |
+| seqread_cold_4k | 45 MB/s | **88 MB/s** | **+96%** |
+| meta_create | 1366 ops/s | 1499 ops/s | +10% |
+| meta_stat | 625 ops/s | 694 ops/s | +11% |
+| meta_delete | 626 ops/s | 695 ops/s | +11% |
+| randread_4k | 692 IOPS | 808 IOPS | +17% |
+
+`seqwrite_4k` is the cleanest yardstick (one FUSE write = one kick per op): 43 → 71 MB/s is a
+per-op RTT drop from **~95 µs to ~58 µs**, i.e. the doorbell recovered **~38 µs** of the ~65 µs
+the profile measured *outside* every host-side stage — confirming that residual was largely the
+kick path. The 4k-sequential rows gain most (kick-bound); 1M-block rows are bandwidth-bound and
+move within run-to-run noise. e2e `file_selftest` stays green.
+
+### What it took
+
+- **`vmworker-sys`** (new crate) — `GetVmWorkerProcess` bound dynamically from `vmwpctrl.dll`
+  (no import lib), plus hand-declared vtables for `IVmVirtualDeviceAccess` (`GetDevice` at slot 4
+  — one `_Reserved` slot precedes it), `IVmFiovGuestMemoryFastNotification`
+  (`Register`/`UnregisterDoorbell`), and `IVmFiovGuestMmioMappings` (declared for DAX, unused).
+  Constants/layout per WSL's open IDL; method shapes confirmed on Microsoft Learn.
+- **`hdv::vmworker::FiovDoorbells`** — safe wrapper: `connect(runtime_id, instance_id)` →
+  `GetVmWorkerProcess` → `GetDevice(FLEXIO_DEVICE_ID, instance)` → QI fast-notification; pins the
+  process MTA once (`CoIncrementMTAUsage`); caches the interface for unregister (the device can't
+  be re-fetched once it's being removed). Connected lazily on the first registration that needs it.
+- **Runtime id** — `hvfs_host` queries it from `HcsGetComputeSystemProperties` (`RuntimeId`),
+  lazily and failure-tolerantly (a miss just leaves kicks on the intercept), and threads it
+  through `attach_shared` → `doorbell.rs`.
+- **`doorbell.rs`** — now tries `HdvRegisterDoorbell` first, then the VM-worker route on its
+  `E_ACCESSDENIED`; the guard remembers which route registered so unregister matches.
+
+### The teardown trap (fixed)
+
+Activating the doorbell shifted teardown timing and exposed a **latent** aperture-cache race
+(present all along, just timing-masked): the cache (`HdvApertureMem`) is finalised
+asynchronously on the IOCP worker thread, and its `Aperture` drops call
+`HdvDestroyGuestMemoryAperture` — which **faults inside `vmdevicehost` if the device is already
+torn down** (observed via the faulting stack: `HdvDestroyGuestMemoryAperture` ← `Aperture::drop`
+← `VirtioFsQueue` drop on the pool thread, after `HdvTeardownDeviceHost`). Fix: `hdv::DeviceHost`
+owns an `Arc<AtomicBool>` liveness flag, flipped `false` at the *start* of its `Drop` (before
+`HdvTeardownDeviceHost`); every cached `Aperture` is stamped with a clone and skips the unmap
+when it reads dead. The platform reclaims all apertures with the device, so skipping is correct,
+not a leak. This is independent of doorbells — it hardens teardown generally.
+
+### DAX is now ~80% plumbed
+
+`IVmFiovGuestMmioMappings` rides the same `GetDevice` channel and is already declared in
+`vmworker-sys`. DAX (`shmem_size > 0`) becomes: query that interface alongside the
+fast-notification one, `CreateSectionBackedMmioRange` a host section into a BAR page range, and
+teach `mem.rs` to serve that window directly instead of the aperture cache.
 
 ---
 
@@ -495,6 +549,11 @@ phases with serial parity everywhere else.
 
 ### VM-worker channel sources (K2 / DAX)
 
+- **Our implementation:** `crates/vmworker-sys` (raw FFI: `GetVmWorkerProcess` + the three FIOV
+  COM interfaces), `crates/hdv/src/vmworker.rs` (`FiovDoorbells` safe wrapper),
+  `crates/virtio-hdv/src/doorbell.rs` (route selection), `hcs-sys` `HcsGetComputeSystemProperties`
+  + `hyperv_virtiofs` `hcs_runtime_id` (runtime-id plumbing). The teardown-race fix lives in
+  `hdv::{DeviceHost,Aperture}` (the `alive` flag) + `virtio-hdv::mem`.
 - **WSL (open source, MIT), `E:\dev\WSL`** — the reference broker implementation:
   - `src/windows/common/DeviceHostProxy.{h,cpp}` — `RegisterDoorbell`/`UnregisterDoorbell`,
     `GetVmWorkerProcess` → `GetDevice` → `IVmFiovGuestMemoryFastNotification`, the 8-doorbell cap.

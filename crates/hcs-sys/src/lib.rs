@@ -85,7 +85,25 @@ unsafe extern "system" {
         options: PCWSTR,
     ) -> HRESULT;
 
+    /// Query a compute system's properties document (async; result via
+    /// [`HcsWaitForOperationResult`]). The JSON includes `RuntimeId` — the id
+    /// `GetVmWorkerProcess` wants (it is **not** the configuration GUID).
+    /// `propertyQuery` may be null for the default property set.
+    pub fn HcsGetComputeSystemProperties(
+        computeSystem: HCS_SYSTEM,
+        operation: HCS_OPERATION,
+        propertyQuery: PCWSTR,
+    ) -> HRESULT;
+
     pub fn HcsCloseComputeSystem(computeSystem: HCS_SYSTEM);
+}
+
+// `LocalFree` — frees the result documents HCS allocates (per the
+// `HcsWaitForOperationResult` contract).
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    pub fn LocalFree(hMem: *mut c_void) -> *mut c_void;
 }
 
 #[cfg(not(windows))]
@@ -129,7 +147,17 @@ mod not_windows {
     pub unsafe fn HcsTerminateComputeSystem(_: HCS_SYSTEM, _: HCS_OPERATION, _: PCWSTR) -> HRESULT {
         E_NOTIMPL
     }
+    pub unsafe fn HcsGetComputeSystemProperties(
+        _: HCS_SYSTEM,
+        _: HCS_OPERATION,
+        _: PCWSTR,
+    ) -> HRESULT {
+        E_NOTIMPL
+    }
     pub unsafe fn HcsCloseComputeSystem(_: HCS_SYSTEM) {}
+    pub unsafe fn LocalFree(_: *mut c_void) -> *mut c_void {
+        core::ptr::null_mut()
+    }
 }
 #[cfg(not(windows))]
 pub use not_windows::*;

@@ -11,9 +11,12 @@
 
 use hdv_sys as sys;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub mod pci;
 pub mod proxy;
+pub mod vmworker;
 
 /// Re-export the raw GUID type so consumers can name device class/instance/host
 /// ids (e.g. to derive distinct per-device instance ids) without depending on
@@ -45,6 +48,15 @@ fn hr(code: sys::HRESULT) -> Result<()> {
 /// Dropping it tears down every device created from it.
 pub struct DeviceHost {
     handle: sys::HDV_HOST,
+    /// `true` while the host (and so every device on it) is live. Flipped to
+    /// `false` at the *start* of [`Drop`], before `HdvTeardownDeviceHost`
+    /// invalidates the devices. [`Aperture`]s stamped with a clone
+    /// ([`alive_flag`](Self::alive_flag)) read it to skip
+    /// `HdvDestroyGuestMemoryAperture` once the device is gone — the cache is
+    /// finalised asynchronously on a worker thread, so its unmaps can otherwise
+    /// race teardown and fault inside `vmdevicehost`. The platform reclaims all
+    /// apertures with the device, so skipping the unmap is correct, not a leak.
+    alive: Arc<AtomicBool>,
 }
 
 // The handle is owned exclusively and HDV's host APIs are thread-safe.
@@ -63,7 +75,22 @@ impl DeviceHost {
         let mut handle: sys::HDV_HOST = std::ptr::null_mut();
         // SAFETY: caller guarantees a valid HCS_SYSTEM; `handle` is a valid out ptr.
         hr(unsafe { sys::HdvInitializeDeviceHost(compute_system, &mut handle) })?;
-        Ok(Self { handle })
+        Ok(Self::wrap(handle))
+    }
+
+    /// Wrap a freshly-created host handle with a live `alive` flag.
+    fn wrap(handle: sys::HDV_HOST) -> Self {
+        Self {
+            handle,
+            alive: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A clone of the host-liveness flag, to stamp onto [`Aperture`]s
+    /// ([`Aperture::set_liveness`]) so their drop skips the unmap once the host
+    /// is torn down. See [`DeviceHost::alive`].
+    pub fn alive_flag(&self) -> Arc<AtomicBool> {
+        self.alive.clone()
     }
 
     /// Like [`open`](Self::open) but via `HdvInitializeDeviceHostEx`, so flags can
@@ -80,7 +107,7 @@ impl DeviceHost {
         let mut handle: sys::HDV_HOST = std::ptr::null_mut();
         // SAFETY: caller guarantees a valid HCS_SYSTEM; `handle` is a valid out ptr.
         hr(unsafe { sys::HdvInitializeDeviceHostEx(compute_system, flags, &mut handle) })?;
-        Ok(Self { handle })
+        Ok(Self::wrap(handle))
     }
 
     /// Create a **proxied** device host via `HdvInitializeDeviceHostForProxy`: the
@@ -119,7 +146,7 @@ impl DeviceHost {
                 &mut handle,
             )
         })?;
-        Ok(Self { handle })
+        Ok(Self::wrap(handle))
     }
 
     /// Raw host handle, for passing to `HdvCreateDeviceInstance`.
@@ -130,6 +157,10 @@ impl DeviceHost {
 
 impl Drop for DeviceHost {
     fn drop(&mut self) {
+        // Mark the host dead *before* the teardown so any aperture unmap that
+        // races behind us (the cache finalises on a worker thread) skips
+        // `HdvDestroyGuestMemoryAperture` instead of faulting on a freed device.
+        self.alive.store(false, Ordering::Release);
         if !self.handle.is_null() {
             // SAFETY: `handle` came from a successful HdvInitializeDeviceHost and
             // is dropped exactly once.
@@ -179,6 +210,7 @@ impl Device {
             device: self.0,
             ptr: mapped,
             len: len as usize,
+            alive: None,
         })
     }
 
@@ -227,6 +259,12 @@ pub struct Aperture {
     device: sys::HDV_DEVICE,
     ptr: sys::PVOID,
     len: usize,
+    /// Optional host-liveness flag (see [`DeviceHost::alive`]). When present and
+    /// `false`, the device is gone and [`Drop`] must **not** call
+    /// `HdvDestroyGuestMemoryAperture` — the platform already reclaimed the
+    /// aperture, and calling into the freed device faults. `None` keeps the
+    /// unconditional-destroy behaviour for callers that don't stamp it.
+    alive: Option<Arc<AtomicBool>>,
 }
 
 unsafe impl Send for Aperture {}
@@ -247,10 +285,25 @@ impl Aperture {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Stamp this aperture with a host-liveness flag (from
+    /// [`DeviceHost::alive_flag`]) so its drop is skipped once the device is
+    /// torn down. Without it, a teardown-racing unmap faults in `vmdevicehost`.
+    pub fn set_liveness(&mut self, alive: Arc<AtomicBool>) {
+        self.alive = Some(alive);
+    }
 }
 
 impl Drop for Aperture {
     fn drop(&mut self) {
+        // Skip the unmap if the device is known-dead — destroying an aperture
+        // against a torn-down device faults inside `vmdevicehost`, and the
+        // platform has already reclaimed it.
+        if let Some(alive) = &self.alive {
+            if !alive.load(Ordering::Acquire) {
+                return;
+            }
+        }
         if !self.ptr.is_null() {
             // SAFETY: `ptr` came from HdvCreateGuestMemoryAperture on `device`
             // and is destroyed exactly once.

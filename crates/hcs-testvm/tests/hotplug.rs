@@ -289,9 +289,16 @@ fn try_two_then_remove(
     let instance2 = INSTANCE_B;
 
     // --- device #1 (hp1) ---
-    let device1 =
-        VirtioHdvDevice::attach_shared(host.clone(), ws1, "hp1", guest_mem, &class1, &instance1)
-            .expect("attach device #1 on shared host");
+    let device1 = VirtioHdvDevice::attach_shared(
+        host.clone(),
+        ws1,
+        "hp1",
+        guest_mem,
+        &class1,
+        &instance1,
+        None,
+    )
+    .expect("attach device #1 on shared host");
     vm.modify(&add_slot_request(
         &guid_to_string(&instance1),
         &guid_to_string(&class1),
@@ -304,9 +311,16 @@ fn try_two_then_remove(
     eprintln!("device #1 (hp1) mounted; adding device #2…");
 
     // --- device #2 (hp2), on the SAME host, distinct class + instance ---
-    let device2 =
-        VirtioHdvDevice::attach_shared(host.clone(), ws2, "hp2", guest_mem, &class2, &instance2)
-            .expect("attach device #2 on shared host");
+    let device2 = VirtioHdvDevice::attach_shared(
+        host.clone(),
+        ws2,
+        "hp2",
+        guest_mem,
+        &class2,
+        &instance2,
+        None,
+    )
+    .expect("attach device #2 on shared host");
     vm.modify(&add_slot_request(
         &guid_to_string(&instance2),
         &guid_to_string(&class2),

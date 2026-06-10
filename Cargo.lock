@@ -504,6 +504,7 @@ name = "hdv"
 version = "0.1.0"
 dependencies = [
  "hdv-sys",
+ "vmworker-sys",
 ]
 
 [[package]]
@@ -1791,6 +1792,13 @@ dependencies = [
  "tracing",
  "vm_resource",
  "zerocopy",
+]
+
+[[package]]
+name = "vmworker-sys"
+version = "0.1.0"
+dependencies = [
+ "hdv-sys",
 ]
 
 [[package]]

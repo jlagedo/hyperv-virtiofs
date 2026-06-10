@@ -70,7 +70,7 @@ use guestmem::{GuestMemory, GuestMemoryAccess, GuestMemoryBackingError};
 use hdv::Aperture;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -295,6 +295,7 @@ impl Shard<Arc<Aperture>> {
     /// `err_addr` is the original access address, only for error reporting. The
     /// returned `Arc` keeps the mapping alive even if a later access evicts the
     /// cache entry, so the caller may copy through it without holding the lock.
+    #[allow(clippy::too_many_arguments)]
     fn get_or_create(
         &self,
         device: &hdv::Device,
@@ -302,6 +303,7 @@ impl Shard<Arc<Aperture>> {
         len: u64,
         err_addr: u64,
         stats: &Stats,
+        alive: &Arc<AtomicBool>,
     ) -> Result<Arc<Aperture>, GuestMemoryBackingError> {
         let mut map = self.cache.write().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.fetch_add(1, Relaxed) + 1;
@@ -346,6 +348,11 @@ impl Shard<Arc<Aperture>> {
                 }
             }
         };
+        // Stamp the host-liveness flag so this aperture's drop skips the unmap
+        // once the device is torn down (the cache finalises on a worker thread,
+        // which can otherwise race teardown and fault in `vmdevicehost`).
+        let mut ap = ap;
+        ap.set_liveness(alive.clone());
         let ap = Arc::new(ap);
         map.insert(
             (base, len),
@@ -367,6 +374,10 @@ impl Shard<Arc<Aperture>> {
 /// late-bound device.
 pub struct HdvApertureMem {
     handle: DeviceHandle,
+    /// Host-liveness flag, stamped onto every cached [`Aperture`] so the cache's
+    /// asynchronous teardown skips `HdvDestroyGuestMemoryAperture` once the
+    /// device is gone (see [`hdv::DeviceHost::alive_flag`]).
+    alive: Arc<AtomicBool>,
     /// Upper bound on valid guest physical addresses (the guest RAM size).
     max_address: u64,
     /// The aperture cache, split into [`SHARDS`] independently-locked shards so
@@ -412,11 +423,16 @@ impl HdvApertureMem {
     /// Wrap into an OpenVMM [`GuestMemory`]. `ram_size` is the guest RAM size; the
     /// admissible GPA ceiling (`max_address`) is derived from it via
     /// [`ram_size_to_max_gpa`] to account for the high-memory remap above 4 GiB.
-    pub fn into_guest_memory(handle: DeviceHandle, ram_size: u64) -> GuestMemory {
+    pub fn into_guest_memory(
+        handle: DeviceHandle,
+        ram_size: u64,
+        alive: Arc<AtomicBool>,
+    ) -> GuestMemory {
         GuestMemory::new(
             "hdv",
             Self {
                 handle,
+                alive,
                 max_address: ram_size_to_max_gpa(ram_size),
                 shards: std::array::from_fn(|_| Shard::default()),
                 stats: Stats::new(),
@@ -503,7 +519,7 @@ impl HdvApertureMem {
                 self.stats.count(&self.stats.hits);
                 ap
             }
-            None => shard.get_or_create(&device, base, span, addr, &self.stats)?,
+            None => shard.get_or_create(&device, base, span, addr, &self.stats, &self.alive)?,
         };
         let host_base = ap.as_ptr() as usize;
         // SAFETY: `addr..end` lies within `[base, base+span)` mapped by `ap`. The

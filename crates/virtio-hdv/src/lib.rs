@@ -198,6 +198,7 @@ impl VirtioHdvDevice {
             guest_mem_size,
             &hdv::pci::HVFS_DEVICE_CLASS_ID,
             instance_id,
+            None,
         )
     }
 
@@ -207,6 +208,12 @@ impl VirtioHdvDevice {
     /// `instance_id`** and a matching `FlexibleIov` slot (a second slot reusing an
     /// `EmulatorId` is rejected with `ERROR_HV_INVALID_PARAMETER`). The caller keeps
     /// the `Arc<DeviceHost>` and passes a clone per device.
+    ///
+    /// `runtime_id` is the compute system's **RuntimeId** (from its HCS
+    /// properties — not the configuration GUID), used for the VM-worker
+    /// doorbell route; pass it when the calling process owns the compute
+    /// system. `None` limits queue kicks to `HdvRegisterDoorbell` (denied on
+    /// restricted hosts) and the MMIO-intercept fallback.
     pub fn attach_shared(
         host: Arc<DeviceHost>,
         workspace: &Path,
@@ -214,6 +221,7 @@ impl VirtioHdvDevice {
         guest_mem_size: u64,
         class_id: &hdv::GUID,
         instance_id: &hdv::GUID,
+        runtime_id: Option<hdv::GUID>,
     ) -> Result<Self, AttachError> {
         // A background IOCP pool drives the device's async tasks (queue workers,
         // deferred config reads) for its whole lifetime.
@@ -222,7 +230,11 @@ impl VirtioHdvDevice {
         // The HDV device handle is bound after create; the memory + MSI seams
         // read it from this shared cell.
         let handle = DeviceHandle::new();
-        let guest_memory = HdvApertureMem::into_guest_memory(handle.clone(), guest_mem_size);
+        // The host-liveness flag gates aperture unmaps: the cache finalises on a
+        // worker thread and must skip `HdvDestroyGuestMemoryAperture` once the
+        // host (hence the device) is torn down, or it faults in `vmdevicehost`.
+        let guest_memory =
+            HdvApertureMem::into_guest_memory(handle.clone(), guest_mem_size, host.alive_flag());
 
         let seen: SeenInterrupts = InterruptLog::new();
         let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
@@ -251,13 +263,16 @@ impl VirtioHdvDevice {
             Box::new(VirtioFsDevice::new(&driver_source, tag, fs, 0, None))
         };
 
-        // Queue kicks: HDV doorbells (kernel-signaled queue events) by default;
-        // VIRTIO_HDV_DOORBELL=0 — or a failing HdvRegisterDoorbell — falls back
-        // to the BAR0 MMIO intercept (a user-mode round trip per kick). See
+        // Queue kicks: kernel-signaled doorbells by default — HdvRegisterDoorbell
+        // first, then the VM-worker channel when `runtime_id` is known (the
+        // owner-side route; restricted hosts always deny the HDV call). Either
+        // failing falls back to the BAR0 MMIO intercept (a user-mode round trip
+        // per kick). VIRTIO_HDV_DOORBELL=0 pins the intercept path. See
         // `doorbell.rs` for the profile that motivated this.
         let doorbells: Option<Arc<dyn guestmem::DoorbellRegistration>> =
             doorbell::enabled().then(|| {
-                Arc::new(doorbell::HdvDoorbells::new(handle.clone()))
+                let worker = runtime_id.map(|rid| (rid, *instance_id));
+                Arc::new(doorbell::HdvDoorbells::new(handle.clone(), worker))
                     as Arc<dyn guestmem::DoorbellRegistration>
             });
 

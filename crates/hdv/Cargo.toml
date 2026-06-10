@@ -12,3 +12,4 @@ publish = false
 
 [dependencies]
 hdv-sys = { path = "../hdv-sys" }
+vmworker-sys = { path = "../vmworker-sys" }

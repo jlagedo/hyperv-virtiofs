@@ -71,12 +71,26 @@ fn two_custom_class_cold_devices_are_rejected() {
     );
     let guest_mem = cfg.memory_mb as u64 * 1024 * 1024;
     // Both device *creations* succeed; the platform only rejects the pair at power-on.
-    let _d1 =
-        VirtioHdvDevice::attach_shared(host.clone(), &ws1, "c1", guest_mem, &class1, &instance1)
-            .expect("attach device #1");
-    let _d2 =
-        VirtioHdvDevice::attach_shared(host.clone(), &ws2, "c2", guest_mem, &class2, &instance2)
-            .expect("attach device #2");
+    let _d1 = VirtioHdvDevice::attach_shared(
+        host.clone(),
+        &ws1,
+        "c1",
+        guest_mem,
+        &class1,
+        &instance1,
+        None,
+    )
+    .expect("attach device #1");
+    let _d2 = VirtioHdvDevice::attach_shared(
+        host.clone(),
+        &ws2,
+        "c2",
+        guest_mem,
+        &class2,
+        &instance2,
+        None,
+    )
+    .expect("attach device #2");
 
     match vm.start() {
         Err(e) if e.contains("0xc0350005") => {
