@@ -27,14 +27,14 @@ using it.
 | # | Item | Where | Gate |
 |---|---|---|---|
 | **F** ✅ | Sharded aperture cache + `Arc<Aperture>` values (copy runs lock-free) | `mem.rs` | done |
-| **A′** | Aperture hit-path: `RwLock` + atomic recency + per-shard stats + fast hasher | `mem.rs` | none — do first |
+| **A′** ✅ | Aperture hit-path: `RwLock` + atomic recency + gated stats + fast hasher | `mem.rs` | done — baseline 3/3 clean, no regression |
 | **A** | `OffloadVirtioFsDevice`: pop → thread-pool dispatch → channel-back → complete | new modules in `virtio-hdv` | needs A′ |
 | **R** | Interrupt re-arm: drop per-tick alloc + activity-gated backoff | `lib.rs`, `interrupt.rs` | alongside A |
 | **E/D** | `attr`/`entry` timeouts; `FUSE_WRITEBACK_CACHE` — **coherence tradeoffs** | wrap the `Fuse` backend | policy decision |
 | **B** | Multiqueue (each queue = A internally) | `OffloadVirtioFsDevice` | guest kernel ≥ 6.10 |
 | ~~C~~ | ~~async lxutil~~ | — | dropped — A makes it moot |
 
-Order: **A′ → A (+R) → measure → decide E/D → maybe B.**
+Order: **A′ ✅ → A (+R) → measure → decide E/D → maybe B.**
 
 ---
 
