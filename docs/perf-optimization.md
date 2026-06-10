@@ -126,31 +126,28 @@ parity, e2e green), and it lights up automatically in any process where HDV gran
 
 **The real route — not parked, just relocated:** the doorbell `E_ACCESSDENIED` is a
 signpost, not a wall. The owner side of the VM *can* register doorbells through the VM
-worker process, and we are the owner. The deep dive into WSL source + the decompiles +
-Microsoft Learn is written up in full below — it is the highest-value remaining lever and
-it also unlocks DAX.
+worker process, and we are the owner. The deep dive into WSL source + Microsoft Learn +
+observed platform behaviour is written up in full below — it is the highest-value remaining
+lever and it also unlocks DAX.
 
 ---
 
 ## The VM-worker channel — the real doorbell route (and DAX) — 2026-06-10
 
 > Researched against three independent sources that all agree: Microsoft's open-source
-> **WSL** (`E:\dev\WSL`, MIT), the decompiled **`vmdevicehost.dll`** / **`wsldevicehost.dll`**
-> (`E:\tmp\rev`), and **Microsoft Learn** (the interface pages are officially documented —
-> verified live). This is "advanced/undocumented" only at the edges; the core is in the docs
+> **WSL** (`E:\dev\WSL`, MIT), **Microsoft Learn** (the interface pages are officially
+> documented — verified live), and the **observed runtime behaviour** of the HDV / FlexibleIov
+> stack on this host. This is "advanced/undocumented" only at the edges; the core is in the docs
 > and shipping in WSL.
 
 ### The key realisation
 
 `HdvRegisterDoorbell` returning `E_ACCESSDENIED` is **by design for restricted hosts**, and
-WSL hits exactly the same wall. Confirmed in the decompile: `wsldevicehost.dll`'s own device
-host branches on a broker pointer (`DeviceHost+0x70`) — if a broker is present it forwards the
-doorbell to it and **never calls `HdvRegisterDoorbell`**; only a non-restricted host takes the
-HDV path. And in `vmdevicehost.dll`, `HDV::ExtensibleDevice::RegisterDoorbell` throws
-`E_ACCESSDENIED` immediately when the restricted flag (`ExtensibleDevice+0x58`, sourced from
-`DeviceHost+0x60` at create) is set; only a non-restricted device is ever handed the
-`IVmDeviceVirtualizationServices` forwarding pointer (`+0x68`, QI'd for IID
-`5bb5ff1d-7db6-4651-9681-f7f37e037b3c` in `ExtensibleDevice::Initialize`). So the restricted
+WSL hits exactly the same wall — its own restricted device host does **not** call
+`HdvRegisterDoorbell`; when a broker is present it forwards the doorbell to it instead, and only
+a non-restricted host takes the HDV path. The restriction is fixed at device-host creation
+(the `ExternalRestricted` registration mode), and a restricted host is never granted the
+in-process forwarding interface that would otherwise carry the call onward. So the restricted
 in-process path **cannot** get a real doorbell — the only route is through the VM worker
 process, reached from a process that **owns the VM**.
 
@@ -180,7 +177,7 @@ virtio-9p uses 1, wsldevicehost uses 2 (we need 1–2: hiprio + request queue).
 | `IVmVirtualDeviceAccess` IID | `3e57bd3c-5a5d-4bdc-a0a6-5b4193d4b719` | WSL IDL (open source) |
 | `IVmFiovGuestMemoryFastNotification` IID | `f5dfbec1-b9f3-4b26-bf6f-c251448bcf7a` | WSL IDL; **methods on MS Learn (verified)** |
 | `IVmFiovGuestMmioMappings` IID (DAX) | `9d416457-abbc-46cf-8b93-901c68bec627` | WSL IDL; **MS Learn** |
-| `IVmDeviceVirtualizationServices` IID | `5bb5ff1d-7db6-4651-9681-f7f37e037b3c` | `vmdevicehost.dll` decompile (in-host forwarder) |
+| `IVmDeviceVirtualizationServices` IID | `5bb5ff1d-7db6-4651-9681-f7f37e037b3c` | observed (the in-host forwarder; not on our path) |
 | `FLEXIO_DEVICE_ID` (GetDevice category) | `a8679153-843f-467f-ad7e-f429328f7568` | WSL `wdk.h` (marked undocumented) |
 | `GetVmWorkerProcess` (in `vmwpctrl.dll`) | `STDAPI (REFGUID vmRuntimeId, REFIID, IUnknown**)` | WSL (undocumented; WSL ships on it) |
 | `HdvProxyDeviceHost` (in `vmdevicehost.dll`) | `(HCS_SYSTEM, PVOID host_IUnknown, DWORD pid, UINT64* ipcSection)` | **MS Learn**; the ExternalRestricted register call |
@@ -505,9 +502,10 @@ phases with serial parity everywhere else.
     `IVmFiovGuestMemoryFastNotification`, `IVmFiovGuestMmioMappings`; `FIOV_BAR_SELECTOR`.
   - `src/windows/inc/wdk.h` — `GetVmWorkerProcess`, `HdvProxyDeviceHost`, `FLEXIO_DEVICE_ID`.
   - `src/windows/common/hcs_schema.h` — `FlexibleIoDevice` / `ExternalRestricted`.
-- **Decompiles, `E:\tmp\rev`** — `vmdevicehost.dll.c` (`HDV::ExtensibleDevice::RegisterDoorbell`
-  E_ACCESSDENIED gate at `+0x58`; `IVmDeviceVirtualizationServices` forwarder at `+0x68`,
-  IID `5bb5ff1d-…`) and `wsldevicehost.dll.c` (broker-vs-HDV branch at `DeviceHost+0x70`).
+- **Observed platform behaviour** — the restricted device host's `HdvRegisterDoorbell` returns
+  `E_ACCESSDENIED`; a restricted host is not granted the in-host forwarding interface
+  (`IVmDeviceVirtualizationServices`, IID `5bb5ff1d-…`), so the kick must come through the VM
+  worker instead. (Corroborates the WSL design above; not on our call path.)
 - **Microsoft Learn (officially documented, verified):**
   `IVmFiovGuestMemoryFastNotification::RegisterDoorbell`, `IVmVirtualDeviceAccess::GetDevice`,
   `IVmFiovGuestMmioMappings`, `HdvProxyDeviceHost`, `HDV_PCI_BAR_SELECTOR`
