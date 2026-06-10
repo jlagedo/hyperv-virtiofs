@@ -40,7 +40,7 @@ use chipset_device::poll_device::PollDevice;
 use futures::executor::block_on;
 use hdv::pci::{PciDetails, PciDevice, PciOps};
 use hdv::DeviceHost;
-use interrupt::{HdvSignalMsi, SeenInterrupts};
+use interrupt::{HdvSignalMsi, InterruptLog, SeenInterrupts};
 use mem::HdvApertureMem;
 use pal_async::task::{Spawn, Task};
 use pal_async::{DefaultDriver, DefaultPool};
@@ -98,10 +98,25 @@ pub struct VirtioHdvDevice {
 /// virtio guest just re-scans the used ring and finds nothing new. This is a
 /// safety net for the proof; the principled fix is a coherent, eviction-managed
 /// guest-memory mapping (as WSL's `HdvGuestMemoryEvictionWorker` implies).
+///
+/// The tick is activity-gated: tight while completions are flowing (that's when
+/// the lost-MSI window matters, and request parallelism raises completion volume),
+/// backed off when the device is quiet so an idle guest isn't machine-gunned with
+/// spurious MSIs. The worst-case recovery for a *sparse* lost interrupt is the
+/// idle tick.
 struct RearmNet {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
+
+/// Re-arm tick while completions flowed within [`REARM_ACTIVE_WINDOW_MS`]:
+/// keep the lost-MSI recovery latency low under load.
+const REARM_TICK_ACTIVE: Duration = Duration::from_millis(5);
+/// Re-arm tick when the device has been quiet: 10× less idle wakeup/MSI churn,
+/// bounding sparse-interrupt recovery at ~50 ms.
+const REARM_TICK_IDLE: Duration = Duration::from_millis(50);
+/// How long after the last delivered MSI the net keeps ticking tight.
+const REARM_ACTIVE_WINDOW_MS: u64 = 100;
 
 impl RearmNet {
     /// Spawn the net. `handle` must already be bound (post-create).
@@ -111,14 +126,18 @@ impl RearmNet {
         let thread = std::thread::Builder::new()
             .name("virtio-hdv-rearm".into())
             .spawn(move || {
+                // One reused buffer — the per-tick snapshot allocates nothing.
+                let mut pairs: Vec<(u64, u32)> = Vec::new();
                 while !stop2.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(5));
+                    let tick = if seen.idle_ms() <= REARM_ACTIVE_WINDOW_MS {
+                        REARM_TICK_ACTIVE
+                    } else {
+                        REARM_TICK_IDLE
+                    };
+                    std::thread::sleep(tick);
                     let Some(device) = handle.get() else { continue };
-                    // Poison-tolerant: this is an un-guarded worker thread, so a
-                    // poisoned lock (from a panic caught at a guarded boundary) must
-                    // degrade, not unwind it. The inner `Vec` is structurally valid.
-                    let pairs = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    for (address, data) in pairs {
+                    seen.snapshot_into(&mut pairs);
+                    for &(address, data) in &pairs {
                         let _ = device.deliver_interrupt(address, data);
                     }
                 }
@@ -202,7 +221,7 @@ impl VirtioHdvDevice {
         let handle = DeviceHandle::new();
         let guest_memory = HdvApertureMem::into_guest_memory(handle.clone(), guest_mem_size);
 
-        let seen: SeenInterrupts = Arc::new(Mutex::new(Vec::new()));
+        let seen: SeenInterrupts = InterruptLog::new();
         let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
         msi_conn.connect(Arc::new(HdvSignalMsi::new(handle.clone(), seen.clone())));
 
